@@ -1,0 +1,18 @@
+# 依赖与运行期产物
+node_modules/
+.preview/
+.ouch/
+reports/
+*.log
+__pycache__/
+.venv/
+.DS_Store
+Thumbs.db
+
+# 完整答案库不进仓库：仓库只带 3 门示例课程，避免公开 4 万题资料。
+# 其余课程的数据文件在本地保留，构建脚本可随时重建。
+data/library.json
+data/answers/*.jsonl
+!data/answers/管理学基础.jsonl
+!data/answers/市场营销学.jsonl
+!data/answers/形势与政策.jsonl

@@ -1,0 +1,58 @@
+{
+  "name": "dsh-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "description": "工作台 · 国开作业：只读同步国开学习平台的课程与作业，用本地答案库生成模拟试卷让 agent 作答并判分，整页执行台展示全过程",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/15819913214/dsh-ouchn-workbench.git"
+  },
+  "homepage": "https://github.com/15819913214/dsh-ouchn-workbench#readme",
+  "bugs": {
+    "url": "https://github.com/15819913214/dsh-ouchn-workbench/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "ouchn",
+    "homework"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "data",
+    "tools",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Workbench · OUCHN homework",
+    "description": "The 工作台 section in the left navigation expands into the 国开作业 tool. It opens one full-page console: student identity and run status on top, the synced real courses with their 形考/终考/讨论 task counts in the left rail, the selected course's task list and per-question detail (stem, answer, source, match score, fill and read-back state) in the middle, the live platform frame and run data on the right, and the agent's execution timeline at the bottom. The host logs in, reads courses and activities read-only, builds a simulated paper from the local answer library, and lets the agent answer it; it never submits answers, creates attempts, or posts to the platform.",
+    "detail": "docs/DETAIL.md"
+  }
+}

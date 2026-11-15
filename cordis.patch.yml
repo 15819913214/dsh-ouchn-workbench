@@ -1,0 +1,10 @@
+- insert:
+    - id: workbench
+      name: 'dsh-workbench'
+      config:
+        # 登录账号：装好后在「设置 → 插件」的配置里填，或者写在这里。
+        # 也可以不改文件，用环境变量 OUCHN_ACCOUNT / OUCHN_PASSWORD（不进仓库）。
+        account: ''
+        password: ''
+        # false = 弹出可见的 Edge 窗口，面板里的「平台画面」就是它。
+        headless: false

@@ -1,0 +1,64 @@
+{
+ "builtAt": "2026-11-16T00:20:45+0800",
+ "source": "sample",
+ "totalRows": 408,
+ "written": 408,
+ "skipped": {
+  "sample only": 39785
+ },
+ "courses": [
+  {
+   "key": "管理学基础",
+   "slug": "管理学基础",
+   "count": 218,
+   "stages": {
+    "FORMATIVE": 218
+   },
+   "qtypes": {
+    "single": 75,
+    "multiple": 75,
+    "judge": 60,
+    "fill": 1,
+    "essay": 7
+   },
+   "files": [
+    "answers/管理学基础/0104-【26春形考作业资料】管理学基础0054760.docx",
+    "answers/管理学基础/地-【国开形考作业资料】管理学基础#00547.docx"
+   ]
+  },
+  {
+   "key": "市场营销学",
+   "slug": "市场营销学",
+   "count": 151,
+   "stages": {
+    "FORMATIVE": 151
+   },
+   "qtypes": {
+    "judge": 60,
+    "single": 59,
+    "multiple": 31,
+    "essay": 1
+   },
+   "files": [
+    "answers/市场营销学/0104-【26春形考作业资料】市场营销学01349.docx"
+   ]
+  },
+  {
+   "key": "形势与政策",
+   "slug": "形势与政策",
+   "count": 39,
+   "stages": {
+    "FORMATIVE": 20,
+    "ANY": 19
+   },
+   "qtypes": {
+    "single": 20,
+    "judge": 19
+   },
+   "files": [
+    "answers/形势与政策/0104-【国开形考作业资料】形势与政策04392.docx",
+    "answers/形势与政策/形势与政策.docx"
+   ]
+  }
+ ]
+}

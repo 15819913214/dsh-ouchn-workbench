@@ -1,0 +1,451 @@
+/**
+ * 国开作业 · 工作台 backend — Host half.
+ *
+ * Registers the model-facing tools that sign in, read the real course catalog,
+ * and solve a locally simulated paper, plus the three routes the panel needs:
+ * the state snapshot it polls, the live browser frame, the simulated paper, and
+ * the generated report.
+ *
+ * The tool shapes are plain registry objects (no `defineTool` import): a locally
+ * linked bundle has no physical node_modules entry for the Harness packages, so a
+ * bare import would fail at load. The registry needs `{ name, description,
+ * parameters, output, execute }`.
+ */
+import path from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { WorkbenchService } from './src/service.js'
+import { renderPaper } from './src/mock.js'
+
+export const name = 'workbench'
+
+/** Only the tool registry is mandatory; routes are optional. */
+export const inject = ['tools']
+
+const packageDir = path.dirname(fileURLToPath(import.meta.url))
+
+const TEXT = (text) => [{ type: 'text', text }]
+const OUTPUT_SCHEMA = { type: 'object', additionalProperties: true }
+
+/* ------------------------------------------------------------------ *
+ * Model-facing rendering
+ * ------------------------------------------------------------------ */
+
+const STAGE_LABEL = { FORMATIVE: '形考', FINAL: '终考', DISCUSSION: '讨论' }
+
+function format(value) {
+  if (!value || typeof value !== 'object') return String(value ?? '')
+  const lines = []
+  const push = (label, text) => { if (text !== undefined && text !== null && text !== '') lines.push(`${label}: ${text}`) }
+
+  if (value.summary && typeof value.summary === 'object') return format(value.summary)
+
+  if (value.url) push('页面', value.url)
+  if (value.title) push('标题', value.title)
+  if (value.student) push('学生', `${value.student.name ?? ''} ${value.student.account ?? ''}`.trim())
+  if (value.courses !== undefined && Array.isArray(value.list)) {
+    push('课程', `${value.courses} 门`)
+    for (const course of value.list) {
+      const counts = course.counts ?? {}
+      lines.push(`- ${course.name}（形考 ${counts.FORMATIVE ?? 0} · 终考 ${counts.FINAL ?? 0} · 讨论 ${counts.DISCUSSION ?? 0}）`
+        + `${course.library ? ` 答案库 ${course.library.count} 题` : ' 答案库未覆盖'}`)
+    }
+  } else if (value.courses !== undefined) {
+    push('课程', `${value.courses} 门`)
+  }
+  if (value.tasks !== undefined) push('任务', `${value.tasks} 个`)
+  if (value.byAvailability) push('可执行性', Object.entries(value.byAvailability).map(([key, count]) => `${key} ${count}`).join(' · '))
+  if (Array.isArray(value.uncovered) && value.uncovered.length) push('答案库未覆盖', value.uncovered.join('、'))
+  if (value.paperId) push('试卷', value.paperId)
+  if (value.count !== undefined && value.paperId) push('题目数', value.count)
+  if (value.warning) push('注意', value.warning)
+  if (value.total !== undefined && value.matched !== undefined) {
+    push('匹配', `${value.matched}/${value.total}`)
+    if (value.filled !== undefined) push('填写', `${value.filled} 题`)
+    if (value.verified) push('回读', value.verified.ok ? '全部一致' : `不一致 ${value.verified.bad} 题`)
+  }
+  if (value.score !== undefined && value.total !== undefined) {
+    push('判分', `${value.score} / ${value.total} 分 · 对 ${value.correct} · 错 ${value.wrong}${value.pending ? ` · 待批改 ${value.pending}` : ''}`)
+  }
+  if (Array.isArray(value.suspect) && value.suspect.length) {
+    push('题库可能有误', `第 ${value.suspect.join('、')} 题（平台没给分）`)
+  }
+  if (Array.isArray(value.results) && value.results.length) {
+    lines.push('', '动作:')
+    for (const entry of value.results) lines.push(`- #${entry.index} ${entry.action} ${entry.ok ? 'OK' : 'FAIL'} ${entry.note}`.trim())
+  }
+  if (Array.isArray(value.failures) && value.failures.length) {
+    lines.push('未解决:')
+    for (const failure of value.failures) lines.push(`- #${failure.seq} ${failure.status} ${failure.note ?? ''} ${failure.stem ?? ''}`.trim())
+  }
+  if (value.html) push('报告', value.html)
+  if (value.answerUrl) push('在线查看', value.answerUrl)
+  if (value.draft && value.topic) {
+    push('讨论主题', value.topic)
+    lines.push('', value.draft)
+  }
+  if (Array.isArray(value.items) && value.items.length) {
+    lines.push('', '任务:')
+    for (const task of value.items.slice(0, 30)) {
+      lines.push(`- ${task.id} ${task.course} · ${STAGE_LABEL[task.stage] ?? task.stage} · ${task.title} · ${task.status}/${task.availability ?? ''}`.trim())
+    }
+    if (value.items.length > 30) lines.push(`… 共 ${value.items.length} 个任务；把 taskId 传给 ouch_exam，完整清单在执行台面板里看`)
+  }
+  if (Array.isArray(value.elements) && value.elements.length) {
+    lines.push('', '元素:')
+    for (const element of value.elements.slice(0, 40)) {
+      lines.push(`- [${element.ref}] <${element.tag}> ${element.text}${element.href ? ` href=${element.href}` : ''}`)
+    }
+  }
+  if (typeof value.text === 'string' && value.text) lines.push('', '正文:', value.text)
+  if (value.kind === 'eval') lines.push('', `eval 结果（${value.chars ?? 0} 字符）:`, String(value.value))
+  if (value.hint) lines.push('', `下一步: ${value.hint}`)
+  if (lines.length === 0) return JSON.stringify(value).slice(0, 1500)
+  return lines.join('\n')
+}
+
+/* ------------------------------------------------------------------ *
+ * Tool definitions
+ * ------------------------------------------------------------------ */
+
+/** One registry-ready tool: service call + step bookkeeping + readable output. */
+function tool(definition) {
+  const { name: toolName, description, parameters, run } = definition
+  return {
+    name: toolName,
+    description,
+    parameters,
+    output: {
+      schema: OUTPUT_SCHEMA,
+      render: (_args, value) => TEXT(format(value)),
+    },
+    async execute(args, exec) {
+      const input = args && typeof args === 'object' ? args : {}
+      const service = definition.service()
+      const step = service.begin(toolName, input)
+      const started = Date.now()
+      try {
+        const value = await run(service, input, exec)
+        service.finish(step, value, Date.now() - started)
+        return value
+      } catch (error) {
+        service.fail(step, error, Date.now() - started)
+        throw error
+      }
+    },
+  }
+}
+
+function createTools(getService) {
+  return [
+    tool({
+      service: getService,
+      name: 'ouch_open',
+      description: '启动（或复用）执行台浏览器并打开一个网址，返回页面正文与可交互元素。'
+        + '平台的登录与同步用 ouch_login / ouch_sync；只有需要看某个具体页面时才用它。',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: '要打开的 http/https 网址；省略则只复用当前页面。' },
+          headless: { type: 'boolean', description: '是否无头运行，默认 false，可以在屏幕上看到浏览器。' },
+          maxChars: { type: 'number', description: '正文最多返回多少字符，默认 1500。' },
+          maxElements: { type: 'number', description: '最多返回多少个可交互元素，默认 60。' },
+        },
+      },
+      run: (service, args, exec) => service.open(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_page',
+      description: '读取执行台浏览器当前页面：正文、可交互元素（ref）、滚动位置；'
+        + '或给 expression 直接在页面里求值并拿到完整 JSON 结果（适合从页面对象里批量取数据）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          expression: { type: 'string', description: '在页面里执行的 JS 表达式，返回完整 JSON 值；省略则读取页面快照。' },
+          maxChars: { type: 'number', description: '正文最多返回多少字符，默认 4000。' },
+          maxElements: { type: 'number', description: '最多返回多少个可交互元素，默认 80。' },
+          screenshot: { type: 'boolean', description: '是否另存一张 PNG 截图。' },
+        },
+      },
+      run: (service, args, exec) => service.page(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_act',
+      description: '在执行台浏览器里按顺序执行页面动作（goto/click/fill/check/press/scroll/wait/reload/back），一次最多 12 个。'
+        + 'check 专门用来点选单选/复选并回读是否真的选中。页面变化后旧 ref 失效，需要新引用时用 ouch_page。',
+      parameters: {
+        type: 'object',
+        properties: {
+          steps: {
+            type: 'array',
+            description: '按顺序执行的动作，失败会立即停止。',
+            items: {
+              type: 'object',
+              additionalProperties: true,
+              properties: {
+                action: { type: 'string', enum: ['goto', 'click', 'check', 'fill', 'press', 'scroll', 'wait', 'reload', 'back', 'screenshot'] },
+                ref: { type: 'string', description: 'ouch_page 返回的元素引用，如 r3。' },
+                selector: { type: 'string', description: 'CSS 选择器。' },
+                text: { type: 'string', description: '按可见文本定位。' },
+                value: { type: 'string', description: 'fill 的值。' },
+                url: { type: 'string', description: 'goto 的网址。' },
+                key: { type: 'string', description: 'press 的按键。' },
+                ms: { type: 'number', description: 'wait 的毫秒数。' },
+                direction: { type: 'string', enum: ['up', 'down'] },
+                amount: { type: 'number' },
+                note: { type: 'string' },
+              },
+              required: ['action'],
+            },
+          },
+        },
+        required: ['steps'],
+      },
+      run: (service, args, exec) => service.act(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_login',
+      description: '用插件配置里的账号登录国开统一身份认证，并读出学生姓名/学校。登录态不持久，新进程需要重新登录一次。',
+      parameters: {
+        type: 'object',
+        properties: {
+          account: { type: 'string', description: '登录名；默认用插件配置的账号。' },
+          password: { type: 'string', description: '密码；默认用插件配置的密码。' },
+        },
+      },
+      run: (service, args, exec) => service.login(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_sync',
+      description: '同步真实的课程与作业结构：登录 → 我的课程 → 逐门课读取形考作业、终考作业、讨论题（只读，不进入任何考试）。'
+        + '返回课程数、任务数、可执行性统计和答案库覆盖情况。',
+      parameters: {
+        type: 'object',
+        properties: {
+          courseId: { type: 'string', description: '只同步某一门课程（LMS 课程 id）；省略则同步全部。' },
+        },
+      },
+      run: (service, args, exec) => service.sync(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_exam',
+      description: '为一个任务生成模拟试卷并在执行台浏览器里打开：题目来自本地答案库，选项顺序被打乱，题数按任务真实题数。'
+        + '平台端不会创建任何答题记录。之后用 ouch_solve 作答。',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: '任务 id（ouch_state 返回，形如 1246228:2149383），也可以传任务标题。' },
+          course: { type: 'string', description: '不给 taskId 时，按课程名取第一个可执行任务。' },
+          stage: { type: 'string', description: '阶段：FORMATIVE / FINAL / DISCUSSION。', enum: ['FORMATIVE', 'FINAL', 'DISCUSSION'] },
+          count: { type: 'number', description: '只取前 N 题（用于演示或分页）。' },
+          rebuild: { type: 'boolean', description: 'true 时重新抽卷，否则复用已生成的试卷。' },
+        },
+      },
+      run: (service, args, exec) => service.exam(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_solve',
+      description: '作答当前模拟试卷：从页面读取题干与选项 → 到答案库匹配 → 把答案映射到打乱后的选项 → 逐题点选/填写 → 回读校验。'
+        + 'fill=false 时只解析匹配不填写。',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: '任务 id；省略时用最后打开的试卷。' },
+          fill: { type: 'boolean', description: '是否真的在页面上点选/填写，默认 true。' },
+          verify: { type: 'boolean', description: '填写后是否回读校验，默认 true。' },
+        },
+      },
+      run: (service, args, exec) => service.solve(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_submit',
+      description: '提交当前模拟试卷并判分：客观题按题库答案比对，主观题记「待批改」，并在页面上逐题标出正确/错误。'
+        + '传 items（平台返回的逐题分数）时改用平台结果判分——平台没给分而题库有答案的题会被标红，说明题库答案可能不符。',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: '任务 id；省略时用最后打开的试卷。' },
+          items: {
+            type: 'array',
+            description: '平台逐题分数：[{seq, score, max}]。省略则本地模拟判分。',
+            items: {
+              type: 'object',
+              additionalProperties: true,
+              properties: {
+                seq: { type: 'number', description: '题号' },
+                score: { type: 'number', description: '该题得分' },
+                max: { type: 'number', description: '该题满分' },
+              },
+              required: ['seq', 'score'],
+            },
+          },
+        },
+      },
+      run: (service, args, exec) => service.submit(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_discussion',
+      description: '处理讨论题：为讨论任务生成一份可用的发言草稿（只存本地，不发帖）。传 content 可用你自己的稿子替换模板。',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: '讨论任务的 id 或标题。' },
+          content: { type: 'string', description: '自定义发言内容；省略则按讨论主题生成结构化草稿。' },
+        },
+        required: ['taskId'],
+      },
+      run: (service, args, exec) => service.discussion(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_library',
+      description: '查看本地答案库：action=stats 全局统计；action=course 某门课的题量/题型；action=search 按题干检索与试匹配。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['stats', 'course', 'search'], description: '默认 stats。' },
+          course: { type: 'string', description: '课程名（可用平台课程名，会做模糊匹配）。' },
+          query: { type: 'string', description: 'search 时的题干片段。' },
+          limit: { type: 'number', description: 'search 返回条数，默认 5。' },
+        },
+      },
+      run: (service, args, exec) => service.library(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_state',
+      description: '读取执行台状态：学生、课程/任务统计、每个任务的 id 与状态（出卷/已答/草稿）、答案库规模、报告路径。'
+        + '决定下一步做哪个任务前先看它。',
+      parameters: { type: 'object', properties: {} },
+      run: async (service, _args, exec) => {
+        await service.hydrate(exec)
+        const summary = service.summary()
+        return {
+          ...summary,
+          items: service.state.tasks.map((task) => ({
+            id: task.id,
+            course: task.courseName,
+            stage: task.stage,
+            title: task.title,
+            status: task.status,
+            availability: task.availabilityLabel,
+            answered: task.answered,
+            total: task.total,
+          })),
+        }
+      },
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_report',
+      description: '把本次执行写成报告：单文件 HTML（可分享）+ 逐题 CSV，返回本地路径和一个可在浏览器打开的地址。',
+      parameters: { type: 'object', properties: {} },
+      run: (service, args, exec) => service.report(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_close',
+      description: '结束本次执行：关闭执行台浏览器并写入完成状态（报告请先用 ouch_report 生成）。',
+      parameters: { type: 'object', properties: {} },
+      run: (service, args, exec) => service.close(args, exec),
+    }),
+  ]
+}
+
+/* ------------------------------------------------------------------ *
+ * Plugin entry
+ * ------------------------------------------------------------------ */
+
+export function apply(ctx, config) {
+  const service = new WorkbenchService(ctx, {
+    packageDir,
+    workDir: readConfig(config, 'workDir', '') || undefined,
+    // Optional: an answer bank kept outside the plugin package.
+    dataDir: readConfig(config, 'dataDir', '') || undefined,
+    // Credentials come from the plugin config or, failing that, the environment,
+    // so a shared repository never carries an account.
+    account: readConfig(config, 'account', '') || process.env.OUCHN_ACCOUNT || '',
+    password: readConfig(config, 'password', '') || process.env.OUCHN_PASSWORD || '',
+    headless: readConfig(config, 'headless', false) === true,
+  })
+  ctx.effect(() => () => { void service.dispose() }, 'workbench.lifetime')
+
+  const getService = () => service
+  for (const definition of createTools(getService)) {
+    ctx.effect(() => ctx.tools.register(definition), `workbench.tool:${definition.name}`)
+  }
+
+  const server = (() => {
+    try { return typeof ctx.get === 'function' ? ctx.get('webServer') : undefined } catch { return undefined }
+  })()
+  if (!server || typeof server.register !== 'function') return
+
+  const route = (routePath, resource, label) => {
+    try {
+      ctx.effect(() => server.register({ kind: 'exact', path: routePath, resource }), `workbench.route:${label}`)
+    } catch (error) {
+      try { ctx.logger?.warn?.(`workbench: ${label} route failed: ${error?.message ?? error}`) } catch { /* ignore */ }
+    }
+  }
+
+  // The panel polls this. An unchanged revision is answered with two fields so a
+  // 1.5 s poll never ships the whole catalog.
+  route('/ouch/state', async (request) => {
+    const url = new URL(request.url, 'http://localhost')
+    const rev = Number(url.searchParams.get('rev') ?? '-1')
+    if (Number.isFinite(rev) && rev === service.state.rev) {
+      return json({ rev, same: true, shotRev: service.state.shotRev })
+    }
+    return json(service.snapshot())
+  }, 'state')
+
+  route('/ouch/shot', async () => {
+    const jpeg = service.shotJpeg()
+    if (!jpeg) return new Response('no shot', { status: 404 })
+    return new Response(jpeg, { headers: { 'content-type': 'image/jpeg', 'cache-control': 'no-store' } })
+  }, 'shot')
+
+  route('/ouch/mock', async (request) => {
+    const url = new URL(request.url, 'http://localhost')
+    const id = url.searchParams.get('paper') ?? ''
+    const paper = service.paperCache.get(id) ?? service.state.papers[id]
+    if (!paper) return new Response('no paper', { status: 404 })
+    return new Response(renderPaper(paper), {
+      headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+    })
+  }, 'mock')
+
+  route('/ouch/report', async (request) => {
+    const url = new URL(request.url, 'http://localhost')
+    const name = path.basename(url.searchParams.get('file') ?? '')
+    const dir = service.reportDir
+    if (!dir || !name.endsWith('.html')) return new Response('no report', { status: 404 })
+    try {
+      const html = await readFile(path.join(dir, name), 'utf8')
+      return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } })
+    } catch {
+      return new Response('no report', { status: 404 })
+    }
+  }, 'report')
+}
+
+function json(value) {
+  return new Response(JSON.stringify(value), {
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+  })
+}
+
+/** Read a config value with a default, tolerating a missing config object. */
+function readConfig(config, key, fallback) {
+  if (!config || typeof config !== 'object') return fallback
+  const value = config[key]
+  return value === undefined || value === null ? fallback : value
+}
