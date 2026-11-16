@@ -38,6 +38,9 @@ export const EXAM_READ_SCRIPT = `(() => {
   const plain = ${PLAIN}
   const heads = Array.from(document.querySelectorAll('.subject-head'))
   const questions = []
+  // 阅读理解的小题既是父题的 sub_subjects，也会单独渲染成 .subject-head，
+  // 同一个 subject 会出现两次；按 subjectId 去重，只保留第一次。
+  const seen = new Set()
   for (const head of heads) {
     let scope
     try { scope = window.angular.element(head).scope() } catch (error) { continue }
@@ -50,6 +53,8 @@ export const EXAM_READ_SCRIPT = `(() => {
     const box = head.closest('.subject') || head.closest('[ng-repeat]') || head.parentElement
     for (const subject of list) {
       if (!subject || !subject.type || subject.type === 'text' || subject.type === 'analysis') continue
+      if (seen.has(subject.id)) continue
+      seen.add(subject.id)
       const indexNode = head.querySelector('.subject-resort-index')
       const indexText = indexNode ? String(indexNode.innerText || '').replace(/[^0-9]/g, '') : ''
       const ordered = (subject.options || []).slice().sort((left, right) => (left.sort || 0) - (right.sort || 0))
@@ -109,6 +114,7 @@ export function examFillScript(plan) {
     const plain = ${PLAIN}
     const heads = Array.from(document.querySelectorAll('.subject-head'))
     const bySeq = new Map()
+    const seen = new Set()
     let order = 0
     for (const head of heads) {
       let scope
@@ -119,6 +125,8 @@ export function examFillScript(plan) {
       const list = children ?? [parent]
       for (const subject of list) {
         if (!subject || !subject.type || subject.type === 'text' || subject.type === 'analysis') continue
+        if (seen.has(subject.id)) continue
+        seen.add(subject.id)
         order += 1
         bySeq.set(order, { head, subject, nested: Boolean(children) })
       }
@@ -164,9 +172,12 @@ export function examFillScript(plan) {
         const ordered = (subject.options || []).slice().sort(function (a, b) { return (a.sort || 0) - (b.sort || 0) })
         const option = ordered[index]
         // 阅读理解的小题和父题共用一个容器，按位置找会串题；选项 id 是全局唯一的，
-        // 优先用它定位，找不到再退回按位置。
-        let input = option ? document.querySelector('input[value="' + option.id + '"]') : null
-        if (!input) input = inputs[index]
+        // 优先用它定位；同一题可能渲染了两份，全部点一遍。
+        const candidates = option ? Array.from(document.querySelectorAll('input[value="' + option.id + '"]')) : []
+        let input = candidates.length ? candidates[0] : inputs[index]
+        for (const node of candidates) {
+          if (!node.checked) node.click()
+        }
         if (input && !input.checked) {
           input.click()
           if (!input.checked) input.dispatchEvent(new MouseEvent('click', { bubbles: true }))
