@@ -296,10 +296,41 @@ export const URLS = {
   examIntro: (courseId, activityId) => `https://lms.ouchn.cn/course/${courseId}/learning-activity#/exam/${activityId}`,
   examTake: (examId) => `https://lms.ouchn.cn/exam/${examId}/subjects#/take`,
   activityFull: (courseId, activityId) => `https://lms.ouchn.cn/course/${courseId}/learning-activity/full-screen#/${activityId}`,
+  // 作业类活动（学习记录、学习行为评价、大作业）没有 exam 路由，必须用 full-screen 的
+  // activity 路由，否则平台返回"未找到资源/没有权限"。
+  homework: (courseId, activityId) => `https://lms.ouchn.cn/course/${courseId}/learning-activity/full-screen#/${activityId}`,
   forum: (courseId, activityId) => `https://lms.ouchn.cn/course/${courseId}/learning-activity/full-screen#/${activityId}`,
   reads: (courseId) => `https://lms.ouchn.cn/api/course/${courseId}/activity-reads-for-user`,
   activity: (activityId) => `https://lms.ouchn.cn/api/activities/${activityId}`,
 }
+
+/**
+ * 打开作业类活动，判断学生端到底有没有提交入口。
+ *
+ * 平台把「学习记录 / 学习行为评价 / 大作业」都做成 homework，评分方式是「教师评阅
+ * 100%」，学生端只有一个「我的作业」页签，多数课程没有可提交的表单。这里把页面事实
+ * 读出来，交给上层决定是记录还是提交，而不是笼统判失败。
+ */
+export async function inspectHomework(session, task) {
+  await session.goto(URLS.homework(task.courseId, task.activityId))
+  await waitFor(session, 'Boolean(document.body && document.body.innerText.length > 200)', 15000)
+  await sleep(600)
+  const page = await session.evaluate(`(() => {
+    const text = String(document.body.innerText || '').replace(/\\s+/g, ' ')
+    const hasForm = Boolean(document.querySelector('[contenteditable="true"], textarea, input[type="file"]'))
+    const submitted = /已提交作业|已批阅|得分[:：]/.test(text) && !/尚未提交作业/.test(text)
+    return {
+      url: location.href,
+      text: text.slice(-600),
+      hasForm,
+      submitted,
+      teacherOnly: /教师评阅\\s*100/.test(text),
+      notSubmitted: /尚未提交作业/.test(text),
+    }
+  })()`)
+  return page
+}
+
 
 /* ------------------------------------------------------------------ *
  * 考试：进入 / 读卷 / 填卷 / 交卷 / 读结果

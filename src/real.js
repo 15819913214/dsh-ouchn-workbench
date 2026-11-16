@@ -12,6 +12,7 @@ import path from 'node:path'
 import { mapOptions } from './answers.js'
 import {
   enterExam, fillExam, postForum, openForum, readCompleteness, readExam, readResult, submitExam, watchVideo,
+  inspectHomework,
 } from './live.js'
 
 const STAGE_LABEL = { FORMATIVE: '形考', FINAL: '终考', DISCUSSION: '讨论' }
@@ -104,11 +105,35 @@ export class RealEngine {
 
   async runTask(task, options = {}) {
     if (task.stage === 'DISCUSSION') return this.runDiscussion(task, options)
+    if (String(task.type) === 'homework') return this.runHomework(task, options)
     if (!Number.isFinite(Number(task.activityId))) {
       this.defect(task, 'task', '任务没有 activityId，无法定位平台活动')
       return { ok: false, note: '任务没有 activityId' }
     }
     return this.runExam(task, options)
+  }
+
+  /** 作业类活动（学习记录/学习行为评价/大作业）：先看有没有学生提交入口。 */
+  async runHomework(task, options = {}) {
+    const record = this.real(task.id)
+    record.phase = 'entering'
+    record.at = Date.now()
+    this.service.bump()
+    const page = await inspectHomework(this.browser, task)
+    record.url = page.url
+    if (page.hasForm && options.answers) {
+      record.phase = 'blocked'
+      record.note = '作业页有提交表单，但当前版本还没实现文件/附件上传，已记录'
+      this.defect(task, 'homework', record.note)
+      this.service.bump()
+      return { ok: false, phase: 'blocked', note: record.note }
+    }
+    record.phase = 'blocked'
+    record.note = page.teacherOnly
+      ? 'homework 类型：教师评阅 100%，学生端无提交入口（我的作业：尚未提交作业）'
+      : 'homework 类型：没有找到可提交的表单'
+    this.service.bump()
+    return { ok: false, phase: 'blocked', note: record.note, submitted: page.submitted }
   }
 
   async runExam(task, options = {}) {
