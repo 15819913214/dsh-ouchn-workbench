@@ -445,14 +445,27 @@ export class RealEngine {
       this.service.bump()
       return { ok: false, note: record.note }
     }
-    const watched = await watchVideo(this.browser, task, { rate: options.rate, need: options.need, maxMs: options.maxMs })
-    record.phase = watched.ok ? 'submitted' : 'failed'
-    record.note = watched.ok
-      ? `视频完成度 ${watched.after}%（要求 ${watched.need}%）`
-      : `视频只到 ${watched.after ?? 0}%（要求 ${watched.need}%）`
-    if (!watched.ok) this.defect(task, 'video', record.note)
+    // 先走平台完成标记（与 tryUnlock 同一路径），再回读平台完成度确认。
+    const bulk = await markCourseVideosComplete(this.browser, task.courseId)
+    let current = await readCompleteness(this.browser, task.courseId, task.activityId)
+    let method = 'completion-api'
+    let watched = null
+    if (!current || Number(current.completeness) < (Number(options.need) || 80)) {
+      // 兜底：平台若改了完成标记逻辑，仍然真的播一遍。
+      watched = await watchVideo(this.browser, task, { rate: options.rate, need: options.need, maxMs: options.maxMs })
+      current = await readCompleteness(this.browser, task.courseId, task.activityId)
+      method = 'playback'
+    }
+    const percent = Number(current?.completeness ?? 0)
+    const ok = percent >= (Number(options.need) || 80) || current?.status === 'full'
+    record.phase = ok ? 'submitted' : 'failed'
+    record.note = ok
+      ? `视频完成度 ${current?.status === 'full' ? 'full' : `${percent}%`}（${method === 'completion-api' ? '平台完成标记' : '播放兜底'}，本课共标记 ${bulk.marked}/${bulk.total} 个视频）`
+      : `视频只到 ${percent}%（要求 ${options.need ?? 80}%），完成标记 ${bulk.marked}/${bulk.total}`
+    record.watched = { method, marked: bulk.marked, total: bulk.total, status: current?.status ?? null, percent, playback: watched }
+    if (!ok) this.defect(task, 'video', record.note)
     this.service.bump()
-    return { ok: watched.ok, ...watched, note: record.note }
+    return { ok, method, marked: bulk.marked, total: bulk.total, status: current?.status ?? null, percent, note: record.note }
   }
 }
 
