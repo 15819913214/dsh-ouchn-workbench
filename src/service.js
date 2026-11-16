@@ -737,6 +737,19 @@ export class WorkbenchService {
       }
     }
 
+    if (action === 'mark') {
+      // 人工在平台做完（或在面板外提交）的任务，用它把结果同步进执行台，
+      // 避免统计里一直显示「未完成」。
+      const record = this.realEngine.real(task.id)
+      record.phase = 'submitted'
+      record.score = Number.isFinite(Number(args.score)) ? Number(args.score) : null
+      record.note = String(args.note || '人工标记为已提交').slice(0, 200)
+      record.at = Date.now()
+      this.recomputeRealStats()
+      this.bump()
+      return { task: briefTask(task), ok: true, phase: 'submitted', note: record.note, score: record.score }
+    }
+
     if (action === 'video') {
       const value = await this.realEngine.runVideo(task, args)
       await this.refreshShot()
