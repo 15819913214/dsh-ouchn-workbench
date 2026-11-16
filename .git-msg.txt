@@ -1,4 +1,0 @@
-feat: ouch_real 增加 mark 动作，把面板外完成的结果同步进执行台
-
-形势与政策大作业已在平台交付，但服务内存里仍是 blocked，统计会误报异常。
-mark 让这类平台外完成的结果能写回 state.real（phase=submitted + 备注）。
