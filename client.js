@@ -759,6 +759,28 @@ window.__ModuleLoader__.load({
       const stats = snapshot?.stats ?? {}
       const library = snapshot?.library ?? { total: 0, courses: 0 }
       const grade = activeTask ? (snapshot?.grades?.[activeTask.id] ?? null) : null
+      // 真实写入平台的进度：一个任务一条，形状见 Host 的 state.real。
+      const realMap = snapshot?.real ?? {}
+      const realStats = snapshot?.realStats ?? { done: 0, submitted: 0, blocked: 0, failed: 0, needsAnswers: 0, scored: 0, scoreSum: 0 }
+      const defects = snapshot?.defects ?? []
+      const realOf = (task) => (task ? realMap[task.id] : null) ?? null
+      const REAL_PHASE_LABEL = {
+        submitted: '平台已交卷', blocked: '平台受阻', 'needs-answers': '待补答案',
+        failed: '失败', error: '脚本报错', 'fill-failed': '填写失败',
+        'verify-failed': '校验不一致', 'submit-failed': '交卷失败', filled: '已填未交',
+        queued: '排队中', pending: '待处理', read: '已读题', video: '刷视频',
+      }
+      const REAL_PHASE_COLOR = {
+        submitted: '#1a7f4b', blocked: '#b26a00', 'needs-answers': '#8a5a00',
+        failed: '#c0392b', error: '#c0392b', 'fill-failed': '#c0392b',
+        'verify-failed': '#c0392b', 'submit-failed': '#c0392b', filled: '#1f60c4',
+      }
+      const realText = (real) => {
+        if (!real) return null
+        const label = REAL_PHASE_LABEL[real.phase] ?? real.phase
+        const score = Number.isFinite(real.score) ? ` ${real.score}分` : ''
+        return `${label}${score}`
+      }
 
       const stageCounts = useMemo(() => {
         const counts = { ALL: 0, FORMATIVE: 0, FINAL: 0, DISCUSSION: 0 }
@@ -930,6 +952,7 @@ window.__ModuleLoader__.load({
                           const score = task.grade
                             ? `${task.grade.score}/${task.grade.total}`
                             : Number.isFinite(task.finalScore) ? String(task.finalScore) : null
+                          const real = realOf(task)
                           return h('div', {
                             key: task.id,
                             style: { ...S.taskItem, ...(on ? S.taskItemOn : null) },
@@ -950,6 +973,10 @@ window.__ModuleLoader__.load({
                                 attempts ? h('span', null, attempts) : null,
                                 task.endTime ? h('span', null, `${t('deadline')} ${String(task.endTime).slice(0, 10)}`) : null,
                                 announce ? h('span', { style: { color: announce === t('immediateScore') ? C.ok : C.muted } }, announce) : null,
+                                real && realText(real) ? h('span', {
+                                  style: { color: REAL_PHASE_COLOR[real.phase] ?? C.muted, fontWeight: 600 },
+                                  title: real.note ?? '',
+                                }, realText(real)) : null,
                                 task.availability !== 'ACTIONABLE' ? h('span', { style: { color: availability.color } }, task.availabilityLabel) : null,
                               ),
                             ),
@@ -1136,6 +1163,26 @@ window.__ModuleLoader__.load({
                     h(KpiDense, { label: t('libraryCourses'), value: formatNumber(library.courses) }),
                     h(KpiDense, { label: t('drafts'), value: formatNumber(stats.drafts) }),
                   ),
+                  // 真实写入平台的进度：比模拟判分更值得盯的一行。
+                  h('div', { style: S.cardHint }, '真实交卷'),
+                  h('div', { style: S.kpiGridDense },
+                    h(KpiDense, { label: '已交卷', value: formatNumber(realStats.submitted ?? 0), color: C.ok }),
+                    h(KpiDense, { label: '待补答案', value: formatNumber(realStats.needsAnswers ?? 0), color: '#8a5a00' }),
+                    h(KpiDense, { label: '平台受阻', value: formatNumber(realStats.blocked ?? 0), color: '#b26a00' }),
+                    h(KpiDense, { label: '失败', value: formatNumber(realStats.failed ?? 0), color: C.error }),
+                    h(KpiDense, { label: '有分任务', value: formatNumber(realStats.scored ?? 0) }),
+                    h(KpiDense, { label: '缺陷', value: formatNumber(defects.length ?? 0), color: defects.length ? C.error : C.muted }),
+                  ),
+                  defects.length
+                    ? h('div', { style: { ...S.pad, maxHeight: 168, overflow: 'auto' } },
+                      h('div', { style: S.cardHint }, '脚本缺陷记录'),
+                      ...defects.slice(-12).map((item) => h('div', {
+                        key: item.id,
+                        style: { fontSize: 11.5, color: C.muted, padding: '3px 0', borderBottom: `1px solid ${C.line}` },
+                        title: item.note,
+                      }, `${item.course ?? ''} · ${item.title ?? ''} · ${item.kind}：${String(item.note ?? '').slice(0, 60)}`)),
+                    )
+                    : null,
                 ),
               ),
             ),

@@ -33,12 +33,56 @@ const OUTPUT_SCHEMA = { type: 'object', additionalProperties: true }
 
 const STAGE_LABEL = { FORMATIVE: '形考', FINAL: '终考', DISCUSSION: '讨论' }
 
+/** 真实作答阶段的中文名，给模型和面板共用。 */
+const PHASE_LABEL = {
+  queued: '排队中',
+  entering: '进入答题页',
+  reading: '读取试题',
+  filling: '填写答案',
+  filled: '已填写未交卷',
+  submitting: '交卷中',
+  submitted: '已交卷',
+  'needs-answers': '缺答案未交卷',
+  blocked: '平台不允许作答',
+  failed: '失败',
+  'fill-failed': '填写失败',
+  'verify-failed': '回读不一致',
+  'submit-failed': '交卷失败',
+  error: '脚本报错',
+  video: '刷视频中',
+  read: '已读题',
+  pending: '待处理',
+}
+
 function format(value) {
   if (!value || typeof value !== 'object') return String(value ?? '')
   const lines = []
   const push = (label, text) => { if (text !== undefined && text !== null && text !== '') lines.push(`${label}: ${text}`) }
 
   if (value.summary && typeof value.summary === 'object') return format(value.summary)
+
+  // 真实作答的单任务结果：阶段、平台分数、缺答案清单，比通用字段更直接。
+  if (value.action && ['run', 'video', 'discussion'].includes(value.action) && (value.phase || value.note)) {
+    if (value.task) push('任务', `${value.task.course} · ${value.task.title}`)
+    if (value.phase) push('阶段', PHASE_LABEL[value.phase] ?? value.phase)
+    if (value.score !== undefined && value.score !== null) push('平台判分', `${value.score} 分`)
+    if (value.answered !== undefined && value.total) push('作答', `${value.answered}/${value.total} 题`)
+    if (value.note) push('结果', value.note)
+    if (Array.isArray(value.missing) && value.missing.length) {
+      lines.push('', '缺答案（未交卷）:')
+      for (const item of value.missing) lines.push(`- #${item.seq}（${item.type}）${item.stem}`)
+    }
+    if (Array.isArray(value.failed) && value.failed.length) {
+      lines.push('', '填写失败:')
+      for (const item of value.failed) lines.push(`- #${item.seq} ${item.note}`)
+    }
+    if (Array.isArray(value.detail) && value.detail.length) {
+      const fromLibrary = value.detail.filter((item) => item.source && item.source.startsWith('题库')).length
+      const fromAi = value.detail.filter((item) => item.source === '人工答案').length
+      push('来源', `题库 ${fromLibrary} · 人工/AI ${fromAi} · 合计 ${value.detail.length}`)
+    }
+    return lines.join('\n')
+  }
 
   if (value.url) push('页面', value.url)
   if (value.title) push('标题', value.title)
@@ -71,8 +115,26 @@ function format(value) {
     push('题库可能有误', `第 ${value.suspect.join('、')} 题（平台没给分）`)
   }
   if (Array.isArray(value.results) && value.results.length) {
-    lines.push('', '动作:')
-    for (const entry of value.results) lines.push(`- #${entry.index} ${entry.action} ${entry.ok ? 'OK' : 'FAIL'} ${entry.note}`.trim())
+    lines.push('', value.action === 'run' || value.ran !== undefined ? '任务结果:' : '动作:')
+    for (const entry of value.results) {
+      if (entry.id) {
+        lines.push(`- ${entry.course} · ${STAGE_LABEL[entry.stage] ?? entry.stage} · ${entry.title} → ${entry.phase}${entry.score !== null && entry.score !== undefined ? ` ${entry.score} 分` : ''} ${entry.note ?? ''}`.trim())
+      } else {
+        lines.push(`- #${entry.index} ${entry.action} ${entry.ok ? 'OK' : 'FAIL'} ${entry.note}`.trim())
+      }
+    }
+  }
+  if (Array.isArray(value.missing) && value.missing.length) {
+    lines.push('', '缺答案:')
+    for (const item of value.missing) lines.push(`- #${item.seq}（${item.type}）${item.stem}`)
+  }
+  if (Array.isArray(value.questions) && value.questions.length) {
+    lines.push('', '试题:')
+    for (const question of value.questions) {
+      lines.push(`- #${question.seq} [${question.type}] ${question.points ?? ''}分 ${question.stem}`)
+      for (const option of question.options ?? []) lines.push(`    ${option}`)
+      if (question.hasUpload) lines.push('    （该题要求上传附件）')
+    }
   }
   if (Array.isArray(value.failures) && value.failures.length) {
     lines.push('未解决:')
@@ -303,6 +365,51 @@ function createTools(getService) {
         required: ['taskId'],
       },
       run: (service, args, exec) => service.discussion(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_real',
+      description: '真实写入平台：open 打开任务页看状态；read 进入考试并读真实试题（同时把题目落盘）；'
+        + 'answers 保存主观题/讨论稿的人工答案；run 进入→读题→作答→回读校验→交卷→读平台判分；'
+        + 'video 播放视频补完成度解锁前置；discussion 在讨论区发帖。'
+        + '题目没有全部拿到答案时不会交卷。',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: '任务 id（ouch_state 返回）' },
+          course: { type: 'string', description: '不给 taskId 时按课程名取任务' },
+          stage: { type: 'string', description: 'FORMATIVE / FINAL / DISCUSSION', enum: ['FORMATIVE', 'FINAL', 'DISCUSSION'] },
+          action: { type: 'string', description: 'open / read / answers / run / video / discussion', enum: ['open', 'read', 'answers', 'run', 'video', 'discussion'] },
+          submit: { type: 'boolean', description: 'action=run 时是否交卷，默认 true' },
+          answers: { type: 'object', description: 'action=answers：{ "题号": "答案文本" }；run 时也可直接传 { seq, letters|text } 数组' },
+          batch: { type: 'object', description: 'action=answers：一次写多个任务 { "<taskId>": { discussion: "…", title: "…", "1": "…" } }' },
+          title: { type: 'string', description: '讨论帖标题' },
+          content: { type: 'string', description: '讨论帖正文（也可传给 answers 保存）' },
+          rate: { type: 'number', description: '视频倍速，默认 16' },
+          need: { type: 'number', description: '需要的视频完成度百分比，默认 80' },
+        },
+      },
+      run: (service, args, exec) => service.realTool(args, exec),
+    }),
+    tool({
+      service: getService,
+      name: 'ouch_run',
+      description: '批量跑真实作业：按课程/阶段筛选，逐个任务进入平台作答并在全部题目都有答案时交卷；'
+        + '遇到未开放、无权限、缺答案只记录不中断。跑完返回逐任务结果。',
+      parameters: {
+        type: 'object',
+        properties: {
+          course: { type: 'string', description: '只跑某门课（课程名片段或课程 id）' },
+          stage: { type: 'string', description: '只跑某个阶段', enum: ['FORMATIVE', 'FINAL', 'DISCUSSION'] },
+          stages: { type: 'string', description: '多个阶段，逗号分隔，如 FORMATIVE,FINAL' },
+          taskIds: { type: 'array', description: '只跑这些任务 id', items: { type: 'string' } },
+          limit: { type: 'number', description: '最多跑几个任务' },
+          submit: { type: 'boolean', description: '是否交卷，默认 true' },
+          includeSubmitted: { type: 'boolean', description: '是否包含已交卷的任务重跑' },
+          answers: { type: 'array', description: '可选的作答计划 [{seq, letters?, text?}]，只对当个任务有效时用 ouch_real' },
+        },
+      },
+      run: (service, args, exec) => service.runBatch(args, exec),
     }),
     tool({
       service: getService,

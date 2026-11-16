@@ -15,7 +15,9 @@ import { AnswerLibrary, mapOptions } from './answers.js'
 import { BrowserSession } from './browser.js'
 import { ensureLogin, fetchCourseActivities, fetchCourses } from './lms.js'
 import { READ_ANSWERS_SCRIPT, READ_PAPER_SCRIPT, buildPaper, fillScript, renderPaper } from './mock.js'
+import { RealEngine } from './real.js'
 import { buildCsv, buildHtml } from './report.js'
+import { enterExam, openForum, readCompleteness, readExam } from './live.js'
 
 const MAX_TIMELINE = 140
 const MAX_TEXT = 200_000
@@ -32,6 +34,8 @@ const TOOL_LABEL = {
   ouch_solve: '模拟答题',
   ouch_submit: '提交判分',
   ouch_discussion: '讨论题草稿',
+  ouch_real: '真实作答',
+  ouch_run: '批量跑作业',
   ouch_library: '答案库',
   ouch_state: '读取状态',
   ouch_report: '生成报告',
@@ -78,6 +82,10 @@ export function emptyState() {
     discussions: {},
     timeline: [],
     stats: { courses: 0, tasks: 0, papers: 0, questions: 0, answered: 0, matched: 0, unmatched: 0, verified: 0, drafts: 0, graded: 0, correct: 0, wrong: 0, pending: 0, elapsedMs: 0 },
+    // 真实写入平台的进度（一个任务一条）与运行中发现的脚本缺陷。
+    real: {},
+    defects: [],
+    realStats: { done: 0, submitted: 0, blocked: 0, failed: 0, needsAnswers: 0, scored: 0, scoreSum: 0 },
     library: { total: 0, courses: 0, builtAt: null },
     report: null,
     startedAt: null,
@@ -102,6 +110,7 @@ export class WorkbenchService {
     this.answerLibrary = new AnswerLibrary(this.dataDir)
     this.state = emptyState()
     this.browser = null
+    this.realEngine = new RealEngine(this)
     this.paperCache = new Map()
     this.shot = null
     this.saveTimer = null
@@ -219,6 +228,8 @@ export class WorkbenchService {
       answered: done,
       library: state.library,
       stats: state.stats,
+      realStats: state.realStats,
+      defects: (state.defects || []).length,
       report: state.report,
     }
   }
@@ -583,6 +594,240 @@ export class WorkbenchService {
         progress: course.progress,
       })),
     }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 真实写入平台
+   * ---------------------------------------------------------------- */
+
+  /** 登录态会过期，批量作答前确认一次。 */
+  async ensureLoggedIn() {
+    const auth = await ensureLogin(this.browser, { account: this.account, password: this.password })
+    if (!auth.loggedIn) throw new Error(loginErrorText(auth))
+    if (!this.state.student) this.state.student = await this.readProfile()
+    return auth
+  }
+
+  /** 把读到的真实试题落到工作目录，供补写主观题答案。 */
+  async dumpPaper(task, paper) {
+    try {
+      const dir = path.join(this.baseDir(this.lastExec), 'papers')
+      await mkdir(dir, { recursive: true })
+      const file = path.join(dir, `${String(task.id).replace(':', '-')}.json`)
+      await writeFile(file, `${JSON.stringify({
+        taskId: task.id,
+        course: task.courseName,
+        title: task.title,
+        stage: task.stage,
+        url: paper.url,
+        questions: (paper.questions || []).map((question) => ({
+          seq: question.seq,
+          type: question.type,
+          points: question.points,
+          stem: question.stem,
+          options: question.options,
+          hasUpload: question.hasUpload,
+        })),
+        at: new Date().toISOString(),
+      }, null, 2)}\n`, 'utf8')
+      return file
+    } catch {
+      return null
+    }
+  }
+
+  /** 讨论题兜底模板（与 ouch_discussion 共用）。 */
+  draftForTask(task) {
+    return draftFor(task)
+  }
+
+  /** `ouch_real`：一个任务上的细粒度动作。 */
+  async realTool(args, exec) {
+    await this.hydrate(exec)
+    await this.ensureBrowser(exec)
+    const action = String(args.action || 'run')
+    const task = this.findTask(args.taskId, args.course, args.stage)
+    if (action === 'answers') {
+      const store = await this.realEngine.loadAnswers()
+      // 支持一次写多门任务：{ batch: { "<taskId>": { discussion, title, "1": "…" } } }
+      if (args.batch && typeof args.batch === 'object') {
+        let saved = 0
+        for (const [key, value] of Object.entries(args.batch)) {
+          if (!value || typeof value !== 'object') continue
+          const previous = store[key] && typeof store[key] === 'object' ? store[key] : {}
+          store[key] = { ...previous, ...value }
+          saved += 1
+        }
+        await this.realEngine.saveAnswers(store)
+        return { batch: true, tasks: saved, totalTasks: Object.keys(store).length }
+      }
+      const key = String(task.id)
+      const previous = store[key] && typeof store[key] === 'object' ? store[key] : {}
+      const answers = args.answers && typeof args.answers === 'object' ? args.answers : {}
+      store[key] = { ...previous, ...answers }
+      if (args.title) store[key].title = String(args.title)
+      if (args.content) store[key].discussion = String(args.content)
+      await this.realEngine.saveAnswers(store)
+      return { task: briefTask(task), saved: Object.keys(answers).length, keys: Object.keys(store[key]).slice(0, 20) }
+    }
+
+    await this.ensureLoggedIn()
+    this.state.phase = 'real'
+    this.bump()
+
+    if (action === 'open') {
+      let value
+      if (task.stage === 'DISCUSSION') value = await openForum(this.browser, task)
+      else if (String(task.type) === 'online_video') value = await readCompleteness(this.browser, task.courseId, task.activityId)
+      else value = await enterExam(this.browser, task)
+      await this.refreshShot()
+      this.state.phase = null
+      this.bump()
+      return { task: briefTask(task), action, value }
+    }
+
+    if (action === 'read') {
+      const entered = await enterExam(this.browser, task)
+      if (!entered.ok) {
+        this.state.phase = null
+        const record = this.realEngine.real(task.id)
+        record.phase = entered.phase || 'failed'
+        record.blocked = entered.reason || entered.note || null
+        record.note = entered.reason || entered.note || null
+        this.realEngine.defect(task, 'enter', record.note)
+        this.bump()
+        return { task: briefTask(task), ok: false, phase: entered.phase, reason: entered.reason, note: entered.note }
+      }
+      const paper = await readExam(this.browser)
+      const file = await this.dumpPaper(task, paper)
+      await this.refreshShot()
+      this.state.phase = null
+      const record = this.realEngine.real(task.id)
+      record.phase = 'read'
+      record.questions = paper.questions.length
+      record.url = paper.url
+      this.bump()
+      return {
+        task: briefTask(task),
+        ok: true,
+        file,
+        count: paper.questions.length,
+        questions: paper.questions.map((question) => ({
+          seq: question.seq,
+          type: question.type,
+          points: question.points,
+          stem: question.stem,
+          options: question.options.map((option) => `${option.letter}. ${option.text}`),
+          hasUpload: question.hasUpload,
+        })),
+      }
+    }
+
+    if (action === 'video') {
+      const value = await this.realEngine.runVideo(task, args)
+      await this.refreshShot()
+      this.state.phase = null
+      this.recomputeRealStats()
+      return { task: briefTask(task), action, ...value }
+    }
+
+    if (action === 'discussion') {
+      const value = await this.realEngine.runDiscussion(task, args)
+      await this.refreshShot()
+      this.state.phase = null
+      this.recomputeRealStats()
+      return { task: briefTask(task), action, ...value }
+    }
+
+    const value = await this.realEngine.runTask(task, { ...args, submit: args.submit !== false })
+    await this.refreshShot()
+    this.state.phase = null
+    this.recomputeRealStats()
+    return { task: briefTask(task), action: 'run', ...value }
+  }
+
+  /**
+   * `ouch_run`：按筛选条件连续跑任务。
+   *
+   * 每跑一个任务就把状态写进 `state.real`，面板轮询一次就能看到进度；遇到
+   * blocked / needs-answers 不中断整批，只记录，方便最后一并处理。
+   */
+  async runBatch(args, exec) {
+    await this.hydrate(exec)
+    await this.ensureBrowser(exec)
+    await this.ensureLoggedIn()
+    const course = args.course ? String(args.course) : null
+    const stages = args.stages
+      ? String(args.stages).split(',').map((item) => item.trim().toUpperCase()).filter(Boolean)
+      : (args.stage ? [String(args.stage).toUpperCase()] : ['FORMATIVE', 'FINAL', 'DISCUSSION'])
+    const limit = Number(args.limit) > 0 ? Number(args.limit) : Infinity
+    const includeSubmitted = args.includeSubmitted === true
+    let candidates = this.state.tasks.filter((task) => stages.includes(task.stage))
+    if (course) candidates = candidates.filter((task) => task.courseName.includes(course) || String(task.courseId) === course)
+    if (Array.isArray(args.taskIds) && args.taskIds.length) {
+      const wanted = new Set(args.taskIds.map(String))
+      candidates = candidates.filter((task) => wanted.has(String(task.id)) || wanted.has(String(task.activityId)))
+    }
+    if (!includeSubmitted) {
+      candidates = candidates.filter((task) => {
+        const real = this.state.real[task.id]
+        return !real || !['submitted', 'filled'].includes(real.phase)
+      })
+    }
+    candidates = candidates.slice(0, limit)
+
+    this.state.phase = 'run'
+    this.state.mode = 'live'
+    const results = []
+    let index = 0
+    for (const task of candidates) {
+      index += 1
+      this.state.current = { taskId: task.id, course: task.courseName, title: task.title, index, total: candidates.length }
+      const record = this.realEngine.real(task.id)
+      record.phase = 'queued'
+      this.bump()
+      let outcome
+      try {
+        outcome = await this.realEngine.runTask(task, { ...args, submit: args.submit !== false })
+      } catch (error) {
+        outcome = { ok: false, phase: 'error', note: String(error?.message ?? error) }
+        this.realEngine.defect(task, 'error', outcome.note)
+        record.phase = 'error'
+        record.note = outcome.note
+      }
+      results.push({
+        id: task.id, course: task.courseName, stage: task.stage, title: task.title,
+        ok: outcome.ok === true, phase: outcome.phase ?? record.phase, note: outcome.note ?? record.note ?? '',
+        score: outcome.score ?? record.score ?? null,
+      })
+      this.recomputeRealStats()
+      this.bump()
+    }
+    this.state.current = null
+    this.state.phase = null
+    await this.refreshShot()
+    const summary = {
+      ran: results.length,
+      submitted: results.filter((item) => item.phase === 'submitted').length,
+      needsAnswers: results.filter((item) => item.phase === 'needs-answers').length,
+      blocked: results.filter((item) => item.phase === 'blocked').length,
+      failed: results.filter((item) => !item.ok && !['needs-answers', 'blocked'].includes(item.phase)).length,
+    }
+    return { ...summary, results: results.slice(0, 60) }
+  }
+
+  recomputeRealStats() {
+    const stats = { done: 0, submitted: 0, blocked: 0, failed: 0, needsAnswers: 0, scored: 0, scoreSum: 0 }
+    for (const record of Object.values(this.state.real || {})) {
+      if (record.phase === 'submitted') {
+        stats.done += 1
+        stats.submitted += 1
+        if (Number.isFinite(record.score)) { stats.scored += 1; stats.scoreSum += record.score }
+      } else if (record.phase === 'blocked') stats.blocked += 1
+      else if (record.phase === 'needs-answers') stats.needsAnswers += 1
+      else if (['failed', 'error', 'submit-failed', 'fill-failed', 'verify-failed'].includes(record.phase)) stats.failed += 1
+    }
+    this.state.realStats = stats
   }
 
   async library(args, exec) {
@@ -1104,6 +1349,12 @@ function describeResult(tool, value) {
   if (!value || typeof value !== 'object') return null
   if (tool === 'ouch_login') return `已登录：${value.student?.name ?? ''}`
   if (tool === 'ouch_sync') return `${value.courses} 门课程 · ${value.tasks} 个任务`
+  if (tool === 'ouch_run') return `跑 ${value.ran} 个任务 · 交卷 ${value.submitted} · 缺答案 ${value.needsAnswers} · 受阻 ${value.blocked}`
+  if (tool === 'ouch_real') {
+    if (value.action === 'read') return `读到 ${value.count ?? 0} 题`
+    if (value.phase === 'submitted') return `已交卷${Number.isFinite(value.score) ? ` ${value.score} 分` : ''}`
+    return value.note ?? value.phase ?? null
+  }
   if (tool === 'ouch_exam') return `试卷 ${value.count} 题${value.warning ? '（题库不足）' : ''}`
   if (tool === 'ouch_solve') return `匹配 ${value.matched}/${value.total} · 填写 ${value.filled}`
   if (tool === 'ouch_submit') return `得分 ${value.score}/${value.total} · 对 ${value.correct} 错 ${value.wrong}${value.pending ? ` · 待批改 ${value.pending}` : ''}`

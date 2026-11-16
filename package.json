@@ -1,8 +1,8 @@
-{
+﻿{
   "name": "dsh-workbench",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "工作台 · 国开作业：只读同步国开学习平台的课程与作业，用本地答案库生成模拟试卷让 agent 作答并判分，整页执行台展示全过程",
+  "description": "工作台 · 国开作业：同步国开学习平台的课程与作业，用答案库/AI 真实作答并交卷（可回读校验与读平台判分），同时保留本地模拟判卷与整页执行台",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -56,3 +56,4 @@
     }
   }
 }
+

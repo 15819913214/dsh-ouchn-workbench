@@ -16,12 +16,30 @@ const STRIP = /[\s\u3000·，。、；：？！“”‘’（）《》〈〉【
 /** Leading question numbering: "1.", "（2）", "三、". */
 const LEADING_INDEX = /^\s*(?:\d{1,3}\s*[.、．)）]|[（(]\s*\d{1,3}\s*[)）]|[一二三四五六七八九十]{1,3}\s*[、.．])+/
 
+/**
+ * 题库里的题干后面常跟着整段排版信息（单独一行的"单选题"、"(3.0分)"、
+ * "(难易度:中)"），页面上只有题干本身。这些行不参与匹配，否则同一道题会差出
+ * 十几个字符而匹配不上。
+ */
+const TYPE_LINE = /^\s*(单选题|多选题|判断题|填空题|简答题|论述题|名词解释|计算题|案例分析|不定项选择题)\s*$/
+const SCORE_LINE = /^\s*[（(]?\s*\d+(?:\.\d+)?\s*分\s*[)）]?\s*$/
+const DIFFICULTY_LINE = /^\s*[（(]?\s*难易度/
+
 /** Normalise a stem or option text for comparison. */
 export function normalize(text) {
   let value = String(text ?? '')
   try { value = value.normalize('NFKC') } catch { /* keep the raw text */ }
   value = value.toLowerCase()
   value = value.replace(/<[^>]+>/g, ' ')
+  if (/\n/.test(value)) {
+    const kept = []
+    for (const line of value.split(/\r?\n/)) {
+      if (TYPE_LINE.test(line)) break
+      if (SCORE_LINE.test(line) || DIFFICULTY_LINE.test(line)) continue
+      kept.push(line)
+    }
+    value = kept.join(' ')
+  }
   value = value.replace(LEADING_INDEX, '')
   value = value.replace(STRIP, '')
   return value
