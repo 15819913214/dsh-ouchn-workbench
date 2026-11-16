@@ -5,6 +5,7 @@
  * 用法：node tools/render-console.mjs
  */
 import { readFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -159,6 +160,32 @@ check('Console 首屏不崩且保留关键按钮', () => {
     if (!html.includes(token)) throw new Error(`输出里没有「${token}」`)
   }
   return `${html.length} 字节`
+})
+
+check('错误边界接住渲染异常并给出恢复入口', () => {
+  const t = (key) => (key === 'toolOuchn' ? '国开作业' : key)
+  const html = renderToStaticMarkup(h(T.PanelBoundary, null, h('div', null, '正常内容')))
+  if (!html.includes('正常内容')) throw new Error('正常子树没有渲染')
+  // 服务端渲染不会触发 getDerivedStateFromError，这里直接检查边界类的契约。
+  const next = T.PanelBoundary.getDerivedStateFromError(new Error('boom'))
+  if (!next || !(next.error instanceof Error)) throw new Error('getDerivedStateFromError 没有返回 error')
+  if (typeof T.SafeConsole !== 'function') throw new Error('缺少 SafeConsole 包装')
+  const crashed = renderToStaticMarkup(h(T.SafeConsole, { t, onBack: () => {} }))
+  if (crashed.length < 100) throw new Error('SafeConsole 渲染结果异常')
+  return '正常子树 + 边界契约 + SafeConsole 均在'
+})
+
+check('右栏与统计区并列：网格列数与子元素一一对应', () => {
+  const source = readFileSync(path.join(root, 'client.js'), 'utf8')
+  // 黑屏回归：网格必须正好是 左栏 | 分隔条 | 任务 | 右栏 四列。
+  const grid = source.match(/gridTemplateColumns: `\$\{layout\.leftW\}px 6px minmax\(0,1fr\) ([^`]+)`/)
+  if (!grid) throw new Error('没找到主网格定义')
+  if (grid[1].includes('6px')) throw new Error(`主网格里还留着多余的分隔列：${grid[1]}`)
+  const liveSection = source.match(/live platform frame \+ 统计区[\s\S]{0,160}/)
+  if (!liveSection) throw new Error('没找到右栏注释锚点')
+  if (!/minWidth: 0/.test(liveSection[0])) throw new Error('右栏容器缺少 minWidth: 0，容易被压成 0 宽')
+  if (!/position: 'absolute', inset: 0, margin: 'auto'/.test(source)) throw new Error('截图没有使用绝对定位自适应')
+  return grid[1]
 })
 
 let failed = 0

@@ -1,6 +1,6 @@
 {
   "name": "dsh-workbench",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "工作台 · 国开作业：账号登录/退出、一键执行并暂停继续，真实作答与交卷，浏览器下方按科目统计正常/异常并下钻明细",
   "license": "MIT",

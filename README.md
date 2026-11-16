@@ -142,7 +142,8 @@ python tools/build-answers.py --db "C:\...\HomeworkCopilot\data\homework.db" --o
 - **渲染兜底**：面板包了一层错误边界，渲染异常会显示可读的错误卡片和「重新加载 / 重试渲染」，不再整页空白。
 - **热更新**：`client.js` 的 mtime/size 变化会被 `@deepseek-ai/dsh-client-hmr` 轮询到，已打开的页面会直接热替换模块；面板另外每 4 秒比一次 `/ouch/ui-stamp`，作为 HMR 未送达时的兜底自动重载。
   想看热更新到底有没有发生，看 `.ouch/client-boots.jsonl`：模块每被浏览器执行一次就落一行 `build` 戳。
-- **离线自检**：`node tools/route-check.mjs`（模拟 webServer 晚就绪，断言 11 条面板路由都注册且不重复）、`node tools/render-console.mjs`（用 react-dom/server 真渲染统计面板、登录卡片、弹窗和首屏）。
+- **离线自检**：`node tools/route-check.mjs`（模拟 webServer 晚就绪，断言 11 条面板路由都注册且不重复）、`node tools/render-console.mjs`（用 react-dom/server 真渲染统计面板、登录卡片、弹窗、错误边界和首屏）。
+- **黑屏回归**：`node tools/serve-preview.mjs` 起静态服务，`node tools/check-live-frame.mjs` 用无头 Edge 打开 `.preview/panel-harness.html`，实测截图 `<img>` 的宽高、是否溢出容器、长宽比、主网格列数、窗口收窄后是否跟着缩放。曾出现过的「登录进去后右栏黑屏」就是主网格多留了一列 6px 分隔条、把右栏挤成 6px 宽，这条脚本能直接复现并拦住。
 - **同步 GitHub**：面板右上角「同步 GitHub」按钮 → `POST /ouch/push`，Host 在本机执行 `git add -A / commit / push origin HEAD`；
   只接受 `127.0.0.1`/`::1` 调用，插件不保存任何 token，用的是这台机器已配置好的 git 凭据。没有改动时只做 `git push` 确认同步。
 

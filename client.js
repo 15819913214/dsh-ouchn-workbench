@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
      * 的 mtime/size 变化后会把整个模块重新执行一遍，页面不用刷新就能拿到新 UI，
      * 这里顺便向 Host 报到一次，方便用 `.ouch/client-boots.jsonl` 验证热更新真的发生了。
      */
-    const CLIENT_BUILD = '2026-11-17T01:50+08:00'
+    const CLIENT_BUILD = '2026-11-17T01:20+08:00'
     try {
       fetch('/ouch/client-boot', {
         method: 'POST',
@@ -561,23 +561,46 @@ window.__ModuleLoader__.load({
     /** The live platform frame served by the Host route. */
     function LiveFrame({ snapshot, t }) {
       const [broken, setBroken] = useState(false)
+      const [loaded, setLoaded] = useState(false)
       const shotRev = snapshot?.shotRev ?? 0
       const hasBrowser = snapshot?.browser?.open === true
-      useEffect(() => { setBroken(false) }, [shotRev])
+      useEffect(() => { setBroken(false); setLoaded(false) }, [shotRev])
+      // 极窄时不画图：整条 6px 的图片只会显示成一条黑边，不如明确提示。
+      const [narrow, setNarrow] = useState(false)
+      const wrapRef = useRef(null)
+      useEffect(() => {
+        const node = wrapRef.current
+        if (!node || typeof ResizeObserver === 'undefined') return undefined
+        const observer = new ResizeObserver((entries) => {
+          const box = entries[0]?.contentRect
+          if (box) setNarrow(box.width < 80 || box.height < 60)
+        })
+        observer.observe(node)
+        return () => observer.disconnect()
+      }, [])
 
       return h('div', { style: S.live },
-        h('div', { style: S.shotWrap },
-          hasBrowser && shotRev > 0 && !broken
+        h('div', { ref: wrapRef, style: S.shotWrap },
+          hasBrowser && shotRev > 0 && !broken && !narrow
             ? h('img', {
               key: shotRev,
               src: `/ouch/shot?v=${shotRev}`,
-              style: { ...S.shot, maxWidth: '100%', maxHeight: '100%', width: 'auto', height: 'auto', objectFit: 'contain' },
+              style: {
+                // 绝对定位 + contain：图片始终完整落在容器内，容器变宽变窄都跟着缩放，
+                // 既不会被压成一条，也不会把容器撑高。
+                position: 'absolute', inset: 0, margin: 'auto',
+                maxWidth: '100%', maxHeight: '100%', width: 'auto', height: 'auto',
+                objectFit: 'contain', opacity: loaded ? 1 : 0, transition: 'opacity 120ms ease',
+                background: '#fff', display: 'block',
+              },
               alt: t('platform'),
+              onLoad: () => setLoaded(true),
               onError: () => setBroken(true),
             })
             : h('div', { style: S.empty },
-              h('div', { style: { fontSize: 12, color: C.ink, fontWeight: 600 } }, hasBrowser ? t('shotUnavailable') : t('browserClosed')),
-              h('div', null, hasBrowser ? '—' : t('browserClosedHint')),
+              h('div', { style: { fontSize: 12, color: C.ink, fontWeight: 600 } },
+                hasBrowser ? (narrow ? '画面区域过窄' : broken ? t('shotUnavailable') : t('shotUnavailable')) : t('browserClosed')),
+              h('div', null, hasBrowser ? '拖动分隔条把右栏拉宽，或稍等一帧画面刷新' : t('browserClosedHint')),
               h('a', {
                 href: LOGIN_URL,
                 target: '_blank',
@@ -1166,7 +1189,10 @@ window.__ModuleLoader__.load({
             : h('div', {
               style: {
                 flex: 1, minHeight: 0, display: 'grid',
-                gridTemplateColumns: `${layout.leftW}px 6px minmax(0,1fr) 6px minmax(340px, 34%)`,
+                // 左栏 | 竖分隔条 | 任务+题目 | 右栏。右栏不再有分隔条（统计区固定在浏览器
+                // 画面下方），列数必须和子元素一一对应：多留一列 6px 会把右栏挤到 6px 宽，
+                // 截图被压成一条、只剩深色底 → 用户看到的就是"黑屏"。
+                gridTemplateColumns: `${layout.leftW}px 6px minmax(0,1fr) minmax(360px, 1fr)`,
               },
             },
               // -------- courses
@@ -1337,7 +1363,7 @@ window.__ModuleLoader__.load({
               ),
 
               // -------- live platform frame + 统计区（同一个右栏）
-              h('div', { style: { minHeight: 0, display: 'flex', flexDirection: 'column', gap: 8 } },
+              h('div', { style: { minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 8 } },
                 h('section', { style: { ...S.card, flex: 1, minHeight: 0, background: '#0f1115' } },
                   h(LiveFrame, { snapshot, t }),
                   h('div', { style: S.pageInfo },
@@ -1391,9 +1417,12 @@ window.__ModuleLoader__.load({
     /**
      * 面板级错误边界。
      *
-     * 以前只要 Console 渲染时抛一次（旧构建缺字段、状态 shape 变了），整个面板就是一片
-     * 空白，只能刷新页面才恢复。现在任何渲染异常都落在一张可见的卡片里，并给出
-     * 「重新加载 / 重试渲染」，至少不会"点了插件没反应"。
+     * 渲染期抛一次（旧构建缺字段、状态 shape 变了、宿主给了非数组字段……）以前就是整页
+     * 空白，只能刷新。现在异常落在一张可读卡片里，并给出「重新加载 / 重试渲染」。
+     *
+     * 注意：边界必须**包在 Console 外面**并且能被两种入口共用（宿主 slot 直接渲染
+     * Console、测试台直接渲染 Console），所以导出的是 `SafeConsole`，`apply` 与
+     * `__test` 都用它。
      */
     const ComponentBase = React.Component || function ComponentFallback() {}
     class PanelBoundary extends ComponentBase {
@@ -1426,6 +1455,11 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Console + 错误边界：宿主和测试台都用这个，避免任何一条路径白屏。 */
+    function SafeConsole(props) {
+      return h(PanelBoundary, null, h(Console, props))
+    }
+
     /** Register the accordion rows and the full-page console. */
     function apply(ctx) {
       ctx.effect(() => ctx.locale.register(NS, DICTS), 'workbench.copy')
@@ -1439,7 +1473,7 @@ window.__ModuleLoader__.load({
         name: 'main',
         key: PANEL_ID,
         locale: NS,
-      }, (slotProps) => h(PanelBoundary, null, h(Console, { ...slotProps, t, ctx, onBack: back })))), 'workbench.panel')
+      }, (slotProps) => h(SafeConsole, { ...slotProps, t, ctx, onBack: back }))), 'workbench.panel')
 
       ctx.effect(() => ctx.slots.inject('main', () => ctx.slots.register({
         name: 'main',
@@ -1468,7 +1502,7 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale', 'layout', 'sessions', 'uiSession'],
       apply,
       // 给离线渲染测试用：tools/render-console.mjs 直接渲染这几个纯组件。
-      __test: { Console, StatsPanel, Modal, LoginCard, taskClass },
+      __test: { Console, SafeConsole, StatsPanel, Modal, LoginCard, taskClass, PanelBoundary },
     }
   },
 })
