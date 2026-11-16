@@ -208,6 +208,18 @@ export function examFillScript(plan) {
   })()`
 }
 
+/** 把某一题滚到视野中间，配合逐题热更新给面板看"现在答到第几题"。 */
+export async function scrollToQuestion(session, seq) {
+  return session.evaluate(`(() => {
+    const heads = Array.from(document.querySelectorAll('.subject-head'))
+    const target = heads[Number(${Number(seq) || 1}) - 1]
+    if (!target) return false
+    const box = target.closest('.subject') || target
+    box.scrollIntoView({ block: 'center', behavior: 'instant' })
+    return true
+  })()`).catch(() => false)
+}
+
 /** 视频页：把播放器里的 <video> 找出来并快进播放。 */
 export function videoPlayScript(rate) {
   return `(async () => {

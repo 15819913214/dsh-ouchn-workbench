@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
      * 的 mtime/size 变化后会把整个模块重新执行一遍，页面不用刷新就能拿到新 UI，
      * 这里顺便向 Host 报到一次，方便用 `.ouch/client-boots.jsonl` 验证热更新真的发生了。
      */
-    const CLIENT_BUILD = '2026-11-17T00:20+08:00'
+    const CLIENT_BUILD = '2026-11-17T01:50+08:00'
     try {
       fetch('/ouch/client-boot', {
         method: 'POST',
@@ -527,9 +527,11 @@ window.__ModuleLoader__.load({
       const revRef = useRef(-1)
       const alive = useRef(true)
 
-      const load = useCallback(async () => {
+      const load = useCallback(async (force) => {
         try {
-          const response = await fetch(`/ouch/state?rev=${revRef.current}`, { cache: 'no-store' })
+          // force=true 时忽略本地 rev，让「刷新」按钮一定拿到完整快照。
+          const rev = force === true ? -1 : revRef.current
+          const response = await fetch(`/ouch/state?rev=${rev}`, { cache: 'no-store' })
           if (!response.ok) throw new Error(`HTTP ${response.status}`)
           const data = await response.json()
           if (!alive.current) return
@@ -548,8 +550,8 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         alive.current = true
-        load()
-        const timer = window.setInterval(load, 1600)
+        load(false)
+        const timer = window.setInterval(() => { load(false) }, 1600)
         return () => { alive.current = false; window.clearInterval(timer) }
       }, [load])
 
@@ -569,7 +571,7 @@ window.__ModuleLoader__.load({
             ? h('img', {
               key: shotRev,
               src: `/ouch/shot?v=${shotRev}`,
-              style: S.shot,
+              style: { ...S.shot, maxWidth: '100%', maxHeight: '100%', width: 'auto', height: 'auto', objectFit: 'contain' },
               alt: t('platform'),
               onError: () => setBroken(true),
             })
@@ -584,51 +586,6 @@ window.__ModuleLoader__.load({
               }, `${t('openPlatform')} ↗`),
             ),
         ),
-      )
-    }
-
-    /**
-     * The execution timeline: one compact row per tool call on a continuous rail.
-     *
-     * A row reads left to right — state dot, what ran, what it produced, how long
-     * it took (bar scaled to the slowest step), and when. The newest row is kept
-     * in view, so a live run always shows its latest step without scrolling.
-     */
-    function Timeline({ steps, t, scrollRef }) {
-      if (steps.length === 0) {
-        return h('div', { style: S.hint },
-          h('div', { style: S.hintStrong }, t('noRun')),
-          h('div', null, t('noRunHint')),
-        )
-      }
-      const maxMs = steps.reduce((max, step) => (Number.isFinite(step.ms) ? Math.max(max, step.ms) : max), 0)
-      return h('div', { style: S.tlList, ref: scrollRef },
-        steps.map((step, index) => {
-          const ok = step.state === 'ok'
-          const failed = step.state === 'error'
-          const running = step.state === 'running'
-          const tone = failed ? C.error : running ? '#5b8cff' : C.ok
-          const share = maxMs > 0 && Number.isFinite(step.ms) ? Math.max(3, Math.round((step.ms / maxMs) * 100)) : 3
-          return h('div', { key: step.id, style: S.tlRow, title: step.detail || '' },
-            h('div', { style: S.tlRail },
-              h('i', {
-                style: {
-                  ...S.tlLine,
-                  top: index === 0 ? '50%' : 0,
-                  bottom: index === steps.length - 1 ? '50%' : 0,
-                },
-              }),
-              h('i', { style: { ...S.tlDot, background: tone, boxShadow: running ? `0 0 0 3px rgba(91,140,255,.18)` : 'none' } }),
-            ),
-            h('div', { style: S.tlLabel }, step.label ?? step.tool),
-            h('div', { style: S.tlNote }, step.note || step.detail || ''),
-            h('div', { style: S.tlBarCell },
-              h('div', { style: S.tlBarTrack }, h('i', { style: { ...S.tlBarFill, width: `${share}%`, background: tone } })),
-              h('span', { style: S.tlMs }, Number.isFinite(step.ms) ? elapsed(step.ms) : (running ? '…' : '—')),
-            ),
-            h('div', { style: S.tlTime }, clock(step.at)),
-          )
-        }),
       )
     }
 
@@ -709,6 +666,156 @@ window.__ModuleLoader__.load({
       return (tidy || base).slice(0, 12)
     }
 
+    /** 小徽标。 */
+    function Chip({ tone, children }) {
+      return h('span', { style: { ...S.chip, ...(tone || null) } }, children)
+    }
+
+    /** 通用弹窗：统计明细、日志都用它。 */
+    function Modal({ title, subtitle, onClose, children, width }) {
+      return h('div', {
+        style: {
+          position: 'fixed', inset: 0, zIndex: 9600, background: 'rgba(6,9,16,.62)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24,
+        },
+        onClick: onClose,
+      },
+        h('div', {
+          style: {
+            width: width || 760, maxWidth: '92vw', maxHeight: '84vh', display: 'flex', flexDirection: 'column',
+            background: C.layer1, border: `1px solid ${C.line2}`, borderRadius: 14, overflow: 'hidden',
+            boxShadow: '0 24px 60px rgba(0,0,0,.45)',
+          },
+          onClick: (event) => event.stopPropagation(),
+        },
+          h('div', {
+            style: { display: 'flex', alignItems: 'center', gap: 10, padding: '11px 16px', borderBottom: `1px solid ${C.line}` },
+          },
+            h('b', { style: { fontSize: 13.5 } }, title),
+            subtitle ? h('span', { style: { color: C.muted, fontSize: 11.5 } }, subtitle) : null,
+            h('button', { type: 'button', style: { ...S.btn, marginLeft: 'auto' }, onClick: onClose }, '关闭'),
+          ),
+          h('div', { style: { overflow: 'auto', padding: '10px 16px 18px' } }, children),
+        ),
+      )
+    }
+
+    /** 作业归类：正常 / 异常 / 无需做。异常只看「未完成作答」和「分数不够」。 */
+    const PASS_SCORE = 60
+    function taskClass(task, real) {
+      const type = String(task?.type || '')
+      if (type === 'homework' || type === 'page') return { kind: 'noneed', reason: '无需做作业（平台无学生提交入口）' }
+      if (!real) return { kind: 'bad', reason: '未完成作答（没有作答记录）' }
+      if (real.phase === 'submitted') {
+        const score = Number.isFinite(real.score) ? real.score : null
+        if (score !== null && score < PASS_SCORE) return { kind: 'bad', reason: `分数不够（${score} 分）` }
+        return { kind: 'ok', score, pending: score === null }
+      }
+      if (real.phase === 'blocked') return { kind: 'bad', reason: real.note || '平台限制，未完成作答' }
+      if (real.phase === 'needs-answers') return { kind: 'bad', reason: real.note || '缺答案，未交卷' }
+      if (['failed', 'error', 'submit-failed', 'fill-failed', 'verify-failed'].includes(real.phase)) {
+        return { kind: 'bad', reason: `${real.note || '执行失败'}（${real.phase}）` }
+      }
+      return { kind: 'bad', reason: `未完成作答（${real.phase}）` }
+    }
+
+    /** 登录卡片：退出后 / 首次打开时显示。 */
+    function LoginCard({ onSubmit, busy, notice }) {
+      const box = {
+        height: 34, padding: '0 11px', borderRadius: 8, border: `1px solid ${C.line2}`,
+        background: C.layer2, color: C.ink, fontSize: 12.5, outline: 'none',
+      }
+      const [account, setAccount] = useState('')
+      const [password, setPassword] = useState('')
+      return h('div', { style: { flex: 1, minHeight: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+        h('div', {
+          style: {
+            width: 430, maxWidth: '92vw', display: 'flex', flexDirection: 'column', gap: 11,
+            background: C.layer1, border: `1px solid ${C.line2}`, borderRadius: 14, padding: 22,
+          },
+        },
+          h('div', { style: { fontSize: 15, fontWeight: 700 } }, '登录国开学习平台'),
+          h('div', { style: { color: C.muted, fontSize: 11.5, lineHeight: 1.7 } },
+            '登录后会自动同步该学生的课程与作业，并展示在下方。账号密码只在本次浏览器会话里使用，不写进仓库。'),
+          h('input', {
+            value: account, placeholder: '学号 / 登录名', autoFocus: true, style: box,
+            onChange: (event) => setAccount(event.target.value),
+          }),
+          h('input', {
+            value: password, type: 'password', placeholder: '密码', style: box,
+            onChange: (event) => setPassword(event.target.value),
+            onKeyDown: (event) => { if (event.key === 'Enter') onSubmit(account, password) },
+          }),
+          h('button', {
+            type: 'button', disabled: busy,
+            style: {
+              ...S.btn, height: 34, background: C.brandStrong, color: '#fff', borderColor: 'transparent',
+              fontWeight: 650, opacity: busy ? 0.7 : 1,
+            },
+            onClick: () => onSubmit(account, password),
+          }, busy ? '登录中…' : '登录并同步'),
+          notice ? h('div', { style: { color: C.warn, fontSize: 11.5 } }, notice) : null,
+        ),
+      )
+    }
+
+    /** 浏览器下方的统计区：科目数、作业数、正常、异常（数字可点开明细）。 */
+    function StatsPanel({ agg, run, current, onOpen }) {
+      const tile = (label, value, tone, key) => h('div', {
+        style: {
+          border: `1px solid ${C.line}`, borderRadius: 8, padding: '6px 9px', background: C.layer2,
+          minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2,
+        },
+      },
+        h('div', { style: { color: C.muted, fontSize: 10.5 } }, label),
+        h('button', {
+          type: 'button',
+          disabled: !key,
+          style: {
+            border: 0, background: 'transparent', padding: 0, textAlign: 'left', cursor: key ? 'pointer' : 'default',
+            color: tone || C.ink, fontSize: 17, fontWeight: 700, fontVariantNumeric: 'tabular-nums',
+            textDecoration: key ? 'underline dotted' : 'none', textUnderlineOffset: 3,
+          },
+          onClick: key ? () => onOpen(key) : undefined,
+          title: key ? '点击查看明细' : '',
+        }, formatNumber(value)),
+      )
+      return h('section', {
+        style: { ...S.card, flex: '0 0 auto', maxHeight: 220, display: 'flex', flexDirection: 'column' },
+      },
+        h('div', { style: S.cardHead },
+          h('b', { style: S.cardTitle }, '作业统计'),
+          h('span', { style: S.cardHint },
+            run?.running
+              ? `执行中 ${run.done}/${run.total}${run.paused ? '（已暂停）' : ''}`
+              : agg.courses ? `${agg.courses} 门课 · ${agg.total} 个作业` : '—'),
+        ),
+        h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(4,minmax(0,1fr))', gap: 6, padding: '8px 10px' } },
+          tile('科目总数', agg.courses),
+          tile('作业数量', agg.total, C.ink, 'tasks'),
+          tile('正常', agg.ok, C.ok, 'ok'),
+          tile('异常', agg.bad, agg.bad ? C.error : C.muted, 'bad'),
+        ),
+        current
+          ? h('div', { style: { padding: '0 10px 6px', color: C.muted, fontSize: 11 } },
+            `当前：${current.course || ''} · ${current.title || ''}${current.question ? ` · 第 ${current.question} 题` : ''}`)
+          : null,
+        h('div', { style: { overflow: 'auto', padding: '0 10px 10px', minHeight: 0 } },
+          agg.per.length === 0
+            ? h('div', { style: { color: C.muted, fontSize: 11.5 } }, '还没有同步课程')
+            : agg.per.map((row) => h('div', {
+              key: row.course.id,
+              style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0', borderTop: `1px solid ${C.line}`, fontSize: 11.5 },
+            },
+              h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, row.course.name),
+              h('span', { style: { color: C.muted, fontVariantNumeric: 'tabular-nums' } }, `${row.ok + row.bad + row.noneed} 个`),
+              h('span', { style: { color: C.ok, fontVariantNumeric: 'tabular-nums' } }, `正常 ${row.ok}`),
+              h('span', { style: { color: row.bad ? C.error : C.muted, fontVariantNumeric: 'tabular-nums' } }, `异常 ${row.bad}`),
+            )),
+        ),
+      )
+    }
+
     /** The full-page console. */
     function Console(props) {
       const t = props.t
@@ -717,15 +824,16 @@ window.__ModuleLoader__.load({
       const [stage, setStage] = useState('ALL')
       const [taskId, setTaskId] = useState(null)
       const [layout, setLayout] = useState(loadLayout)
-      // 「同步到 GitHub」按钮的状态：idle / running / done / error
       const [pushState, setPushState] = useState('idle')
       const [pushNote, setPushNote] = useState('')
+      const [modal, setModal] = useState(null)
+      const [diag, setDiag] = useState(null)
+      const [busy, setBusy] = useState('')
+      const [notice, setNotice] = useState('')
 
       useEffect(() => { saveLayout(layout) }, [layout])
 
       // 兜底热更新：Host 回报的 client.js 构建戳一变就自动重载页面。
-      // 页面初次加载只记基线，不会自己触发重载；dsh-client-hmr 送到热替换时
-      // 模块重新执行、基线也重置，两条路径互不打扰。
       useEffect(() => {
         let baseline = null
         let stopped = false
@@ -738,16 +846,30 @@ window.__ModuleLoader__.load({
             const stamp = String(data?.stamp ?? '')
             if (!stamp) return
             if (baseline === null) { baseline = stamp; return }
-            if (stamp !== baseline) { stopped = true; location.reload() }
+            if (stamp !== baseline) { stopped = true; window.location.reload() }
           } catch { /* 网络抖动忽略 */ }
         }, 4000)
         return () => { stopped = true; clearInterval(timer) }
       }, [])
 
+      const api = useCallback(async (path, body) => {
+        const response = await fetch(path, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body || {}),
+        })
+        const data = await response.json().catch(() => ({}))
+        if (!response.ok || data?.ok === false) throw new Error(data?.error || `HTTP ${response.status}`)
+        return data
+      }, [])
+
       const courses = snapshot?.courses ?? []
       const tasks = snapshot?.tasks ?? []
+      const student = snapshot?.student
+      const loggedIn = Boolean(student)
+      const run = snapshot?.run ?? { running: false, paused: false }
+      const current = snapshot?.current ?? null
 
-      // Keep a valid selection as the snapshot changes.
       const activeCourse = useMemo(() => {
         if (!courses.length) return null
         return courses.find((course) => String(course.id) === String(courseId)) ?? courses[0]
@@ -792,70 +914,154 @@ window.__ModuleLoader__.load({
         return null
       }, [snapshot, activeTask])
 
-      const student = snapshot?.student
-      const status = STATUS_TONE[snapshot?.status] ?? STATUS_TONE.idle
       const stats = snapshot?.stats ?? {}
       const library = snapshot?.library ?? { total: 0, courses: 0 }
       const grade = activeTask ? (snapshot?.grades?.[activeTask.id] ?? null) : null
-      // 真实写入平台的进度：一个任务一条，形状见 Host 的 state.real。
       const realMap = snapshot?.real ?? {}
       const realStats = snapshot?.realStats ?? { done: 0, submitted: 0, blocked: 0, failed: 0, needsAnswers: 0, scored: 0, scoreSum: 0 }
       const defects = snapshot?.defects ?? []
       const realOf = (task) => (task ? realMap[task.id] : null) ?? null
-      const REAL_PHASE_LABEL = {
-        submitted: '平台已交卷', blocked: '平台受阻', 'needs-answers': '待补答案',
-        failed: '失败', error: '脚本报错', 'fill-failed': '填写失败',
-        'verify-failed': '校验不一致', 'submit-failed': '交卷失败', filled: '已填未交',
-        queued: '排队中', pending: '待处理', read: '已读题', video: '刷视频',
-      }
-      const REAL_PHASE_COLOR = {
-        submitted: '#1a7f4b', blocked: '#b26a00', 'needs-answers': '#8a5a00',
-        failed: '#c0392b', error: '#c0392b', 'fill-failed': '#c0392b',
-        'verify-failed': '#c0392b', 'submit-failed': '#c0392b', filled: '#1f60c4',
-      }
-      const realText = (real) => {
-        if (!real) return null
-        const label = REAL_PHASE_LABEL[real.phase] ?? real.phase
-        const score = Number.isFinite(real.score) ? ` ${real.score}分` : ''
-        return `${label}${score}`
-      }
+      const status = STATUS_TONE[snapshot?.status] ?? STATUS_TONE.idle
 
-      const stageCounts = useMemo(() => {
-        const counts = { ALL: 0, FORMATIVE: 0, FINAL: 0, DISCUSSION: 0 }
-        for (const task of tasks) {
-          if (activeCourse && String(task.courseId) !== String(activeCourse.id)) continue
-          counts.ALL += 1
-          counts[task.stage] = (counts[task.stage] ?? 0) + 1
+      // 统计口径：正常 / 异常 / 无需做，异常只看未完成与分数不够。
+      const agg = useMemo(() => {
+        const per = courses.map((course) => {
+          const list = tasks.filter((task) => String(task.courseId) === String(course.id))
+          const items = list.map((task) => ({ task, cls: taskClass(task, realMap[task.id]) }))
+          return {
+            course,
+            items,
+            ok: items.filter((item) => item.cls.kind === 'ok').length,
+            bad: items.filter((item) => item.cls.kind === 'bad').length,
+            noneed: items.filter((item) => item.cls.kind === 'noneed').length,
+          }
+        })
+        return {
+          per,
+          courses: courses.length,
+          total: tasks.length,
+          ok: per.reduce((sum, row) => sum + row.ok, 0),
+          bad: per.reduce((sum, row) => sum + row.bad, 0),
+          noneed: per.reduce((sum, row) => sum + row.noneed, 0),
         }
-        return counts
-      }, [tasks, activeCourse])
+      }, [courses, tasks, realMap])
 
-      const hitRate = stats.questions ? Math.round(((stats.matched ?? 0) / stats.questions) * 100) : 0
-      const answeredTasks = tasks.filter((task) => task.status === 'answered').length
-      const handledTasks = tasks.filter((task) => task.status !== 'pending').length
-      const timeline = snapshot?.timeline ?? []
-      const timelineTotal = timeline.reduce((sum, step) => (Number.isFinite(step.ms) ? sum + step.ms : sum), 0)
+      const groupByStage = (items, pick) => STAGES.map((item) => {
+        const rows = items.filter((row) => row.task.stage === item.key)
+        return rows.length ? { stage: item.full, rows: rows.map((row) => ({ text: pick(row), title: row.task.title })) } : null
+      }).filter(Boolean)
 
-      // Keep the newest step in view: a live run always shows where it is now.
-      const timelineRef = useRef(null)
-      useEffect(() => {
-        const node = timelineRef.current
-        if (node) node.scrollTop = node.scrollHeight
-      }, [timeline.length])
+      const modalBody = (() => {
+        if (modal === 'tasks') {
+          const items = agg.per.flatMap((row) => row.items)
+          return h('div', null,
+            h('div', { style: { color: C.muted, fontSize: 11.5, marginBottom: 8 } }, `共 ${items.length} 个作业，按类型分类`),
+            groupByStage(items, (row) => {
+              const cls = row.cls
+              const tail = cls.kind === 'ok'
+                ? (cls.score !== null ? `${cls.score} 分` : '未改分')
+                : cls.kind === 'noneed' ? '无需做作业' : cls.reason
+              return `${row.task.title} · ${tail}`
+            }).map((group) => h('div', { key: group.stage, style: { marginTop: 10 } },
+              h('b', { style: { fontSize: 12.5 } }, `${group.stage}（${group.rows.length}）`),
+              group.rows.map((row) => h('div', { key: row.title, style: { fontSize: 11.5, color: C.muted, padding: '2px 0' } }, `· ${row.text}`)),
+            )),
+          )
+        }
+        if (modal === 'ok') {
+          const items = agg.per.flatMap((row) => row.items).filter((row) => row.cls.kind === 'ok' || row.cls.kind === 'noneed')
+          return h('div', null,
+            h('div', { style: { color: C.muted, fontSize: 11.5, marginBottom: 8 } }, `正常 ${agg.ok} 个 · 无需做作业 ${agg.noneed} 个`),
+            groupByStage(items, (row) => {
+              if (row.cls.kind === 'noneed') return `${row.task.title} · 无需做作业`
+              return `${row.task.title} · ${row.cls.score !== null ? `${row.cls.score} 分` : '未改分'}`
+            }).map((group) => h('div', { key: group.stage, style: { marginTop: 10 } },
+              h('b', { style: { fontSize: 12.5 } }, group.stage),
+              group.rows.map((row) => h('div', { key: row.title, style: { fontSize: 11.5, color: C.muted, padding: '2px 0' } }, `· ${row.text}`)),
+            )),
+          )
+        }
+        if (modal === 'bad') {
+          const items = agg.per.flatMap((row) => row.items).filter((row) => row.cls.kind === 'bad')
+          return h('div', null,
+            h('div', { style: { color: C.muted, fontSize: 11.5, marginBottom: 8 } }, `异常 ${items.length} 个：未完成作答 / 分数不够`),
+            items.length === 0
+              ? h('div', { style: { color: C.ok, fontSize: 12 } }, '没有异常作业')
+              : groupByStage(items, (row) => `${row.task.title} · ${row.cls.reason}`).map((group) => h('div', { key: group.stage, style: { marginTop: 10 } },
+                h('b', { style: { fontSize: 12.5, color: C.error } }, group.stage),
+                group.rows.map((row) => h('div', { key: row.title, style: { fontSize: 11.5, color: C.muted, padding: '2px 0' } }, `· ${row.text}`)),
+              )),
+          )
+        }
+        if (modal === 'log') {
+          return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+            diag
+              ? h('div', { style: { fontSize: 11.5, color: C.muted, whiteSpace: 'pre-wrap', fontFamily: 'ui-monospace, monospace' } },
+                JSON.stringify(diag, null, 2).slice(0, 6000))
+              : h('div', { style: { color: C.muted, fontSize: 12 } }, '读取中…'),
+            !diag
+              ? h('button', {
+                type: 'button',
+                style: S.btn,
+                onClick: () => { fetch('/ouch/diag').then((response) => response.json()).then(setDiag).catch(() => {}) },
+              }, '重新读取')
+              : null,
+          )
+        }
+        return null
+      })()
 
-      /** 把当前工作区提交并推送到 GitHub（Host 侧执行 git，前端只发起与显示结果）。 */
-      const pushToGithub = useCallback(async () => {
-        if (pushState === 'running') return
-        setPushState('running')
-        setPushNote('正在提交并推送…')
+      const openDiag = useCallback(() => {
+        setDiag(null)
+        setModal('log')
+        fetch('/ouch/diag', { cache: 'no-store' })
+          .then((response) => response.json())
+          .then(setDiag)
+          .catch((failure) => setDiag({ ok: false, error: String(failure?.message ?? failure) }))
+      }, [])
+
+      const doLogout = useCallback(async () => {
+        if (!window.confirm('退出当前账号？退出后会清空界面数据，浏览器回到平台登录页。')) return
+        setBusy('logout')
         try {
-          const response = await fetch('/ouch/push', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ message: `chore: 执行台面板同步 ${new Date().toLocaleString('zh-CN')}` }),
-          })
-          const data = await response.json().catch(() => ({}))
-          if (!response.ok || data.ok !== true) throw new Error(data.error || data.note || `HTTP ${response.status}`)
+          await api('/ouch/logout')
+          setNotice('已退出账号')
+          await reload(true)
+        } catch (failure) {
+          setNotice(String(failure?.message ?? failure))
+        } finally { setBusy('') }
+      }, [api, reload])
+
+      const doLogin = useCallback(async (account, password) => {
+        setBusy('login')
+        setNotice('')
+        try {
+          const data = await api('/ouch/login', { account, password })
+          setNotice(`已登录：${data?.student?.name ?? account} · 课程 ${data?.courses ?? 0} · 任务 ${data?.tasks ?? 0}`)
+          await reload(true)
+        } catch (failure) {
+          setNotice(`登录失败：${String(failure?.message ?? failure)}`)
+        } finally { setBusy('') }
+      }, [api, reload])
+
+      const auto = useCallback(async (action) => {
+        setBusy(action)
+        try {
+          await api('/ouch/auto', { action })
+          setNotice(action === 'start' ? '已开始执行' : action === 'pause' ? '已暂停' : action === 'resume' ? '已继续' : '已停止')
+          await reload(true)
+        } catch (failure) {
+          setNotice(`${action} 失败：${String(failure?.message ?? failure)}`)
+        } finally { setBusy('') }
+      }, [api, reload])
+
+      const pushToGithub = useCallback(async () => {
+        setPushState('running')
+        setPushNote('')
+        try {
+          const response = await fetch('/ouch/push', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+          const data = await response.json()
+          if (!response.ok || data?.ok === false) throw new Error(data?.error || `HTTP ${response.status}`)
           setPushState('done')
           setPushNote(data.note || `已推送 ${data.commit ?? ''}`.trim())
         } catch (failure) {
@@ -863,6 +1069,13 @@ window.__ModuleLoader__.load({
           setPushNote(String(failure?.message ?? failure))
         }
       }, [pushState])
+
+      const primaryBtn = {
+        ...S.btn, height: 32, padding: '0 14px', fontWeight: 650,
+        background: C.brandStrong, color: '#fff', borderColor: 'transparent',
+      }
+      const stageCounts = { ALL: scoped.length }
+      for (const item of STAGES) stageCounts[item.key] = scoped.filter((task) => task.stage === item.key).length
 
       return h('div', { style: S.page, 'data-workbench-root': '' },
         h('style', null, KEYFRAMES),
@@ -876,23 +1089,45 @@ window.__ModuleLoader__.load({
                 h('span', { style: { width: 5, height: 5, borderRadius: '50%', background: 'currentColor' } }),
                 status.label,
               ),
-              h('span', { style: { ...S.chip, color: '#9dbcff', background: 'rgba(91,140,255,.12)', borderColor: 'rgba(91,140,255,.26)' } }, t('simulation')),
+              run.running
+                ? h(Chip, { tone: { color: run.paused ? C.warn : '#7ee2a8', background: 'rgba(74,222,128,.10)', borderColor: 'rgba(74,222,128,.28)' } },
+                  `${run.paused ? '已暂停' : '执行中'} ${run.done}/${run.total}`)
+                : null,
               error && snapshot
                 ? h('span', { style: { ...S.chip, color: C.error, background: 'rgba(239,122,122,.12)', borderColor: 'rgba(239,122,122,.24)' } }, '连接中断')
                 : null,
             ),
             h('div', { style: S.subRow },
               snapshot
-                ? `${t('courses')} ${courses.length} · ${t('tasks')} ${tasks.length} · ${t('answered')} ${answeredTasks} · ${t('libraryTotal')} ${library.total}`
-                : error ? t('notServed') : '加载中…',
-            ),
+                ? `${t('courses')} ${courses.length} · ${t('tasks')} ${tasks.length} · 正常 ${agg.ok} · 异常 ${agg.bad} · ${t('libraryTotal')} ${library.total}`
+                : error ? t('notServed') : '加载中…'),
           ),
           h('div', { style: S.sep }),
           h('div', { style: S.student },
-            h('div', { style: S.studentName }, student?.name || t('student')),
-            h('div', { style: S.studentSub }, student ? `${student.account ?? ''}${student.school ? ` · ${student.school}` : ''}` : '—'),
+            h('div', { style: S.studentName }, student?.name || '未登录'),
+            h('div', { style: S.studentSub }, student ? `${student.account ?? ''}${student.school ? ` · ${student.school}` : ''}` : '登录后自动同步课程与作业'),
           ),
           h('div', { style: S.topRight },
+            loggedIn
+              ? h('button', {
+                type: 'button', style: primaryBtn, disabled: busy === 'start' || run.running,
+                onClick: () => auto('start'),
+              }, run.running ? '执行中…' : '开始执行自动化')
+              : null,
+            run.running
+              ? h('button', {
+                type: 'button', style: S.btn, disabled: busy === 'pause',
+                onClick: () => auto(run.paused ? 'resume' : 'pause'),
+              }, run.paused ? '继续' : '暂停')
+              : null,
+            run.running
+              ? h('button', { type: 'button', style: S.btn, disabled: busy === 'stop', onClick: () => auto('stop') }, '停止')
+              : null,
+            loggedIn
+              ? h('button', { type: 'button', style: S.btn, disabled: busy === 'logout', onClick: doLogout }, '退出账号')
+              : null,
+            h('button', { type: 'button', style: S.btn, onClick: () => { reload(true) } }, t('refresh')),
+            h('button', { type: 'button', style: S.btn, onClick: openDiag, title: '查看面板/后端诊断日志' }, '打开日志'),
             snapshot?.report
               ? h('a', {
                 href: `/ouch/report?file=${encodeURIComponent(String(snapshot.report.html).split(/[\\/]/).pop())}`,
@@ -900,7 +1135,6 @@ window.__ModuleLoader__.load({
                 style: { ...S.btn, textDecoration: 'none', display: 'inline-flex', alignItems: 'center' },
               }, t('openReport'))
               : null,
-            h('button', { type: 'button', style: S.btn, onClick: () => { reload() } }, t('refresh')),
             h('button', {
               type: 'button',
               style: {
@@ -915,6 +1149,8 @@ window.__ModuleLoader__.load({
           ),
         ),
 
+        notice ? h('div', { style: { fontSize: 11.5, color: C.muted, padding: '0 2px' } }, notice) : null,
+
         // ---------------------------------------------------------------- body
         error && !snapshot
           ? h('div', { style: { ...S.card, flex: 1 } },
@@ -922,14 +1158,16 @@ window.__ModuleLoader__.load({
               h('div', { style: S.hintStrong }, t('notServed')),
               h('div', null, t('notServedHint')),
               h('div', { style: { ...S.mono, marginTop: 8, opacity: .8 } }, error),
+              h('button', { type: 'button', style: { ...S.btn, marginTop: 10 }, onClick: () => reload(true) }, '重新连接'),
             ),
           )
-          : h('div', {
-            style: { flex: 1, minHeight: 0, display: 'grid', gridTemplateRows: `minmax(0,1fr) 6px ${layout.bottomH}px` },
-          },
-            // ===== top: courses | tasks + questions | platform =====
-            h('div', {
-              style: { minHeight: 0, display: 'grid', gridTemplateColumns: `${layout.leftW}px 6px minmax(0,1fr) 6px ${layout.rightW}px` },
+          : !loggedIn && snapshot
+            ? h(LoginCard, { onSubmit: doLogin, busy: busy === 'login', notice })
+            : h('div', {
+              style: {
+                flex: 1, minHeight: 0, display: 'grid',
+                gridTemplateColumns: `${layout.leftW}px 6px minmax(0,1fr) 6px minmax(340px, 34%)`,
+              },
             },
               // -------- courses
               h('section', { style: S.card },
@@ -990,9 +1228,9 @@ window.__ModuleLoader__.load({
               },
                 h('section', { style: S.card },
                   h('div', { style: S.cardHead },
-                    h('b', { style: S.cardTitle }, t('tasks')),
-                    h('span', { style: S.cardHint }, activeCourse?.name ?? '—'),
-                    h('div', { style: { ...S.cardRight, gap: 3 } },
+                    h('b', { style: S.cardTitle }, activeCourse?.name ?? t('tasks')),
+                    h('span', { style: S.cardHint }, `${scoped.length} ${t('tasksUnit')}`),
+                    h('div', { style: { marginLeft: 'auto', display: 'flex', gap: 4, flexWrap: 'wrap' } },
                       h('button', {
                         type: 'button',
                         style: { ...S.tab, ...(stage === 'ALL' ? S.tabOn : null) },
@@ -1012,58 +1250,29 @@ window.__ModuleLoader__.load({
                       : h('div', { style: S.pad },
                         scoped.map((task) => {
                           const on = activeTask?.id === task.id
-                          const statusInfo = TASK_STATUS[task.status] ?? TASK_STATUS.pending
-                          const availability = AVAILABILITY_TONE[task.availability] ?? AVAILABILITY_TONE.SKIPPED
-                          const attempts = attemptLabel(task, t)
-                          const announce = task.announceScore === 'immediate_announce'
-                            ? t('immediateScore')
-                            : task.announceScore ? t('afterReview') : null
-                          const score = task.grade
-                            ? `${task.grade.score}/${task.grade.total}`
-                            : Number.isFinite(task.finalScore) ? String(task.finalScore) : null
                           const real = realOf(task)
+                          const cls = taskClass(task, real)
+                          const color = cls.kind === 'ok' ? C.ok : cls.kind === 'bad' ? C.error : C.muted
+                          const label = cls.kind === 'ok'
+                            ? (cls.score !== null ? `已完成 ${cls.score} 分` : '已完成 · 未改分')
+                            : cls.kind === 'noneed' ? '无需做作业' : `异常：${cls.reason}`.slice(0, 34)
                           return h('div', {
                             key: task.id,
                             style: { ...S.taskItem, ...(on ? S.taskItemOn : null) },
                             onClick: () => setTaskId(task.id),
-                            onKeyDown: (event) => {
-                              if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setTaskId(task.id) }
-                            },
                             role: 'button',
                             tabIndex: 0,
                           },
-                            h('div', { style: { ...S.stepIc, ...(on ? S.stepIcRun : null) } }, STAGE_GLYPH[task.stage] ?? '·'),
+                            h('div', { style: { ...S.stepIc, ...(on ? S.stepIcRun : null) }, title: task.stageLabel }, STAGE_GLYPH[task.stage] ?? '·'),
                             h('div', { style: { minWidth: 0, flex: 1 } },
                               h('div', { style: S.taskTitle }, task.title),
                               h('div', { style: S.taskMeta },
                                 h('span', null, task.stageLabel ?? task.stage),
                                 task.questionCount ? h('span', null, `${task.questionCount} ${t('questionsUnit')}`) : null,
-                                task.totalPoints ? h('span', null, `${task.totalPoints} ${t('points')}`) : null,
-                                attempts ? h('span', null, attempts) : null,
-                                task.endTime ? h('span', null, `${t('deadline')} ${String(task.endTime).slice(0, 10)}`) : null,
-                                announce ? h('span', { style: { color: announce === t('immediateScore') ? C.ok : C.muted } }, announce) : null,
-                                real && realText(real) ? h('span', {
-                                  style: { color: REAL_PHASE_COLOR[real.phase] ?? C.muted, fontWeight: 600 },
-                                  title: real.note ?? '',
-                                }, realText(real)) : null,
-                                task.availability !== 'ACTIONABLE' ? h('span', { style: { color: availability.color } }, task.availabilityLabel) : null,
+                                h('span', { style: { color } }, label),
+                                task.availability !== 'ACTIONABLE' ? h('span', { style: { color: C.warn } }, task.availabilityLabel) : null,
                               ),
                             ),
-                            score
-                              ? h('span', {
-                                style: {
-                                  ...S.badge,
-                                  color: task.grade && task.grade.wrong > 0 ? C.error : C.ok,
-                                  borderColor: C.line,
-                                  background: 'transparent',
-                                },
-                                title: task.grade ? `正确 ${task.grade.correct} · 错误 ${task.grade.wrong} · 待批改 ${task.grade.pending}` : '',
-                              }, `${t('score')} ${score}`)
-                              : null,
-                            task.total > 0
-                              ? h('span', { style: { ...S.monoCell, minWidth: 42, textAlign: 'right' } }, `${task.answered ?? 0}/${task.total}`)
-                              : null,
-                            h('span', { style: { ...S.badge, ...statusInfo.tone } }, statusInfo.label),
                           )
                         }),
                       ),
@@ -1082,15 +1291,12 @@ window.__ModuleLoader__.load({
                     ),
                     detail?.kind === 'result'
                       ? h('span', { style: S.cardRight },
-                        `${t('total')} ${detail.stats?.total ?? 0} · 匹配 ${detail.stats?.matched ?? 0} · ${t('filledCount')} ${detail.stats?.filled ?? 0}`
-                        + (grade ? ` · ${t('score')} ${grade.score}/${grade.total}${grade.pending ? ` · ${t('pendingGrade')} ${grade.pending}` : ''}` : ''),
-                      )
+                        `${t('total')} ${detail.stats?.total ?? 0} · 匹配 ${detail.stats?.matched ?? 0} · ${t('filledCount')} ${detail.stats?.filled ?? 0}`)
                       : detail?.kind === 'paper'
                         ? h('span', { style: S.cardRight }, `${t('paperReady')} · ${t('total')} ${detail.stats?.total ?? 0}`)
                         : grade
                           ? h('span', { style: S.cardRight },
-                            `${t('score')} ${grade.score}/${grade.total} · ${t('correct')} ${grade.correct} · ${t('wrong')} ${grade.wrong}${grade.pending ? ` · ${t('pendingGrade')} ${grade.pending}` : ''}`,
-                          )
+                            `${t('score')} ${grade.score}/${grade.total} · ${t('correct')} ${grade.correct} · ${t('wrong')} ${grade.wrong}`)
                           : null,
                   ),
                   h('div', { style: S.scroll },
@@ -1108,154 +1314,63 @@ window.__ModuleLoader__.load({
                               h('th', { style: { ...S.th, width: 52 } }, t('type')),
                               h('th', { style: S.th }, t('stem')),
                               h('th', { style: { ...S.th, width: 84 } }, t('answer')),
-                              h('th', { style: { ...S.th, width: 88 } }, t('source')),
-                              h('th', { style: { ...S.th, width: 58 } }, t('match')),
-                              h('th', { style: { ...S.th, width: 58 } }, t('status')),
-                              h('th', { style: { ...S.th, width: 62 } }, t('grade')),
+                              h('th', { style: { ...S.th, width: 74 } }, t('status')),
                             )),
-                            h('tbody', null, (detail.questions ?? []).map((question) => {
-                              const statusInfo = QUESTION_STATUS[question.status] ?? QUESTION_STATUS.matched
-                              const raw = Array.isArray(question.answer) ? question.answer : []
-                              const asLetters = raw.length > 0 && raw.every((item) => /^[A-Za-z]{1,4}$/.test(String(item).trim()))
-                              const letters = asLetters ? raw.join('').toUpperCase() : ''
-                              const textAnswer = asLetters ? '' : (raw.join('；') || String(question.answerText ?? ''))
-                              const graded = grade?.perQuestion?.[question.seq]
-                              const suspect = grade?.suspect?.includes(question.seq)
-                              return h('tr', { key: question.seq },
-                                h('td', { style: { ...S.td, ...S.monoCell } }, question.seq),
-                                h('td', { style: S.td }, question.qtype),
-                                h('td', { style: S.td }, h('div', { style: S.stemCell }, question.stem)),
-                                h('td', { style: S.td },
-                                  letters
-                                    ? h('span', { style: S.ansLetters }, letters)
-                                    : textAnswer
-                                      ? h('span', {
-                                        style: { ...S.monoCell, color: C.muted, display: 'block', maxWidth: 88, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-                                        title: textAnswer.slice(0, 400),
-                                      }, textAnswer)
-                                      : h('span', { style: { ...S.badge, color: C.error, borderColor: 'rgba(239,122,122,.3)' } }, '缺'),
-                                ),
-                                h('td', { style: { ...S.td, ...S.monoCell }, title: question.source?.file ?? '' },
-                                  sourceLabel(question.source?.file, question.tier),
-                                ),
-                                h('td', { style: { ...S.td, ...S.monoCell } },
-                                  question.tier === 'exact' ? '精确'
-                                    : question.tier === 'high' ? `高 ${Math.round((question.score ?? 0) * 100)}%`
-                                      : question.tier === 'medium' ? `中 ${Math.round((question.score ?? 0) * 100)}%`
-                                        : question.tier === 'planned' ? '待答' : question.tier,
-                                ),
-                                h('td', { style: { ...S.td, color: statusInfo.tone.color } }, statusInfo.label),
-                                h('td', { style: { ...S.td, whiteSpace: 'nowrap' } },
-                                  graded
-                                    ? graded.status === 'correct'
-                                      ? h('span', { style: { color: C.ok } }, `${t('correct')} ${graded.score}`)
-                                      : graded.status === 'wrong'
-                                        ? h('span', { style: { color: C.error }, title: suspect ? '平台未给分，题库答案可能不准确' : '' }, t('wrong'))
-                                        : graded.status === 'pending'
-                                          ? h('span', { style: { color: C.warn } }, t('pendingGrade'))
-                                          : '—'
-                                    : '—',
-                                ),
-                              )
-                            })),
+                            h('tbody', null, (detail.questions ?? []).map((question) => h('tr', { key: question.seq },
+                              h('td', { style: { ...S.td, ...S.monoCell } }, question.seq),
+                              h('td', { style: S.td }, question.qtype),
+                              h('td', { style: S.td }, h('div', { style: S.stemCell }, question.stem)),
+                              h('td', { style: { ...S.td, ...S.monoCell } },
+                                Array.isArray(question.answer) && question.answer.length
+                                  ? question.answer.join('')
+                                  : (question.answerText ? String(question.answerText).slice(0, 18) : '—')),
+                              h('td', { style: { ...S.td, color: (QUESTION_STATUS[question.status] ?? QUESTION_STATUS.matched).tone.color } },
+                                (QUESTION_STATUS[question.status] ?? QUESTION_STATUS.matched).label),
+                            ))),
                           )
                           : h('div', { style: S.hint },
                             h('div', { style: S.hintStrong }, t('notStarted')),
-                            h('div', null, t('notStartedHint')
-                              .replace('{course}', activeTask.courseName ?? '')
-                              .replace('{task}', activeTask.title ?? '')),
+                            h('div', null, '点「开始执行自动化」后，这里显示逐题作答明细；也可以让对话里的 agent 单跑某个任务。'),
                           ),
                   ),
                 ),
               ),
 
-              h(Splitter, { orientation: 'v', label: t('resize'), onDrag: (delta) => setLayout((prev) => ({ ...prev, rightW: clamp(prev.rightW - delta, 280, 640) })) }),
-
-              // -------- live platform frame (no chrome: the picture is the card)
-              h('section', { style: { ...S.card, background: '#0f1115' } },
-                h(LiveFrame, { snapshot, t }),
-                h('div', { style: S.pageInfo },
-                  h('div', { style: S.pageInfoRow },
-                    h('b', { style: S.pageInfoKey }, t('student')),
-                    h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
-                      student ? `${student.name ?? ''}${student.account ? ` · ${student.account}` : ''}` : '—'),
-                  ),
-                  h('div', { style: S.pageInfoRow },
-                    h('b', { style: S.pageInfoKey }, t('taskProgress')),
-                    h('span', { style: { ...S.mono, color: C.muted } }, `${handledTasks} / ${tasks.length}`),
-                  ),
-                  h('div', { style: S.pageInfoRow },
-                    h('b', { style: S.pageInfoKey }, t('grade')),
-                    h('span', { style: { ...S.mono, color: grade ? (grade.wrong > 0 ? C.error : C.ok) : C.muted } },
-                      grade ? `${grade.score}/${grade.total} · ${t('correct')} ${grade.correct} · ${t('wrong')} ${grade.wrong}` : '—'),
+              // -------- live platform frame + 统计区（同一个右栏）
+              h('div', { style: { minHeight: 0, display: 'flex', flexDirection: 'column', gap: 8 } },
+                h('section', { style: { ...S.card, flex: 1, minHeight: 0, background: '#0f1115' } },
+                  h(LiveFrame, { snapshot, t }),
+                  h('div', { style: S.pageInfo },
+                    h('div', { style: S.pageInfoRow },
+                      h('b', { style: S.pageInfoKey }, t('student')),
+                      h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                        student ? `${student.name ?? ''}${student.account ? ` · ${student.account}` : ''}` : '—'),
+                    ),
+                    h('div', { style: S.pageInfoRow },
+                      h('b', { style: S.pageInfoKey }, '当前'),
+                      h('span', { style: { ...S.mono, color: C.muted } },
+                        current ? `${current.course || ''} · ${current.title || ''}${current.question ? ` · 第 ${current.question} 题` : ''}` : '—'),
+                    ),
+                    h('div', { style: S.pageInfoRow },
+                      h('b', { style: S.pageInfoKey }, '执行'),
+                      h('span', { style: { ...S.mono, color: C.muted } },
+                        run.running ? `${run.paused ? '暂停' : '运行'} ${run.done}/${run.total}` : (run.note || '空闲')),
+                    ),
                   ),
                 ),
+                h(StatsPanel, { agg, run, current, onOpen: (key) => setModal(key) }),
               ),
             ),
 
-            h(Splitter, { orientation: 'h', label: t('resize'), onDrag: (delta) => setLayout((prev) => ({ ...prev, bottomH: clamp(prev.bottomH - delta, 118, 420) })) }),
-
-            // ===== bottom: timeline | stats =====
-            h('div', {
-              style: { minHeight: 0, display: 'grid', gridTemplateColumns: `minmax(0,1fr) 6px ${layout.statsW}px` },
-            },
-              h('section', { style: S.card },
-                h('div', { style: S.cardHead },
-                  h('b', { style: S.cardTitle }, t('timeline')),
-                  h('span', { style: S.cardHint }, `${timeline.length} 步 · 总耗时 ${elapsed(timelineTotal)}`),
-                  h('span', { style: S.cardRight },
-                    snapshot?.report ? `${t('reports')} · ${String(snapshot.report.html).split(/[\\/]/).pop()}` : t('readonly')),
-                ),
-                h(Timeline, { steps: timeline, t, scrollRef: timelineRef }),
-              ),
-
-              h(Splitter, { orientation: 'v', label: t('resize'), onDrag: (delta) => setLayout((prev) => ({ ...prev, statsW: clamp(prev.statsW - delta, 300, 900) })) }),
-
-              h('section', { style: S.card },
-                h('div', { style: S.cardHead },
-                  h('b', { style: S.cardTitle }, t('stats')),
-                  h('span', { style: S.cardHint }, library.builtAt ? String(library.builtAt).slice(0, 10) : ''),
-                  h('span', { style: S.cardRight }, t('readonly')),
-                ),
-                h('div', { style: S.scroll },
-                  h('div', { style: S.kpiGridDense },
-                    h(KpiDense, { label: t('courses'), value: formatNumber(courses.length) }),
-                    h(KpiDense, { label: t('tasks'), value: formatNumber(tasks.length) }),
-                    h(KpiDense, { label: t('questionsShort'), value: formatNumber(stats.questions) }),
-                    h(KpiDense, { label: t('filledCount'), value: formatNumber(stats.answered) }),
-                    h(KpiDense, { label: t('hitRate'), value: `${hitRate}%`, bar: hitRate }),
-                    h(KpiDense, { label: t('graded'), value: formatNumber(stats.graded) }),
-                    h(KpiDense, { label: t('correct'), value: formatNumber(stats.correct), color: C.ok }),
-                    h(KpiDense, { label: t('wrong'), value: formatNumber(stats.wrong), color: C.error }),
-                    h(KpiDense, { label: t('pendingGrade'), value: formatNumber(stats.pending) }),
-                    h(KpiDense, { label: t('libraryTotal'), value: formatNumber(library.total) }),
-                    h(KpiDense, { label: t('libraryCourses'), value: formatNumber(library.courses) }),
-                    h(KpiDense, { label: t('drafts'), value: formatNumber(stats.drafts) }),
-                  ),
-                  // 真实写入平台的进度：比模拟判分更值得盯的一行。
-                  h('div', { style: S.cardHint }, '真实交卷'),
-                  h('div', { style: S.kpiGridDense },
-                    h(KpiDense, { label: '已交卷', value: formatNumber(realStats.submitted ?? 0), color: C.ok }),
-                    h(KpiDense, { label: '待补答案', value: formatNumber(realStats.needsAnswers ?? 0), color: '#8a5a00' }),
-                    h(KpiDense, { label: '平台受阻', value: formatNumber(realStats.blocked ?? 0), color: '#b26a00' }),
-                    h(KpiDense, { label: '失败', value: formatNumber(realStats.failed ?? 0), color: C.error }),
-                    h(KpiDense, { label: '有分任务', value: formatNumber(realStats.scored ?? 0) }),
-                    h(KpiDense, { label: '缺陷', value: formatNumber(defects.length ?? 0), color: defects.length ? C.error : C.muted }),
-                  ),
-                  defects.length
-                    ? h('div', { style: { ...S.pad, maxHeight: 168, overflow: 'auto' } },
-                      h('div', { style: S.cardHint }, '脚本缺陷记录'),
-                      ...defects.slice(-12).map((item) => h('div', {
-                        key: item.id,
-                        style: { fontSize: 11.5, color: C.muted, padding: '3px 0', borderBottom: `1px solid ${C.line}` },
-                        title: item.note,
-                      }, `${item.course ?? ''} · ${item.title ?? ''} · ${item.kind}：${String(item.note ?? '').slice(0, 60)}`)),
-                    )
-                    : null,
-                ),
-              ),
-            ),
-          ),
+        modal ? h(Modal, {
+          title: modal === 'tasks' ? '全部作业（按类型分类）'
+            : modal === 'ok' ? '正常作业（含未改分 / 无需做）'
+              : modal === 'bad' ? '异常作业（未完成 / 分数不够）'
+                : '运行日志与诊断',
+          subtitle: modal === 'log' ? `client.js ${diag?.clientStamp ?? ''}` : `共 ${tasks.length} 个作业`,
+          onClose: () => setModal(null),
+          width: modal === 'log' ? 820 : 720,
+        }, modalBody) : null,
       )
     }
 
@@ -1264,9 +1379,50 @@ window.__ModuleLoader__.load({
       return function TogglePanel() {
         useEffect(() => {
           setUi({ expanded: !uiStore.expanded })
-          try { layout.selectPanel(null) } catch { /* ignore */ }
+          // 展开时直接把执行台选中，避免"点了没反应、要再点一次/刷新"。
+          window.setTimeout(() => {
+            try { layout.selectPanel(uiStore.expanded ? PANEL_ID : null) } catch { /* ignore */ }
+          }, 0)
         }, [])
         return null
+      }
+    }
+
+    /**
+     * 面板级错误边界。
+     *
+     * 以前只要 Console 渲染时抛一次（旧构建缺字段、状态 shape 变了），整个面板就是一片
+     * 空白，只能刷新页面才恢复。现在任何渲染异常都落在一张可见的卡片里，并给出
+     * 「重新加载 / 重试渲染」，至少不会"点了插件没反应"。
+     */
+    const ComponentBase = React.Component || function ComponentFallback() {}
+    class PanelBoundary extends ComponentBase {
+      constructor(props) {
+        super(props)
+        this.state = { error: null }
+      }
+
+      static getDerivedStateFromError(error) {
+        return { error }
+      }
+
+      componentDidCatch(error, info) {
+        try { console.error('[workbench] panel crashed', error, info) } catch { /* ignore */ }
+      }
+
+      render() {
+        if (!this.state.error) return this.props.children
+        const message = String(this.state.error?.message ?? this.state.error)
+        return h('div', { style: { ...S.page, justifyContent: 'center', alignItems: 'center' } },
+          h('div', { style: { ...S.card, maxWidth: 620, padding: 20, gap: 10 } },
+            h('div', { style: { fontSize: 15, fontWeight: 700 } }, '执行台渲染出错了'),
+            h('div', { style: { color: C.muted, fontSize: 12, whiteSpace: 'pre-wrap' } }, message),
+            h('div', { style: { display: 'flex', gap: 8, marginTop: 6 } },
+              h('button', { type: 'button', style: { ...S.btn, background: C.brandStrong, color: '#fff', borderColor: 'transparent' }, onClick: () => window.location.reload() }, '重新加载页面'),
+              h('button', { type: 'button', style: S.btn, onClick: () => this.setState({ error: null }) }, '重试渲染'),
+            ),
+          ),
+        )
       }
     }
 
@@ -1283,7 +1439,7 @@ window.__ModuleLoader__.load({
         name: 'main',
         key: PANEL_ID,
         locale: NS,
-      }, (slotProps) => h(Console, { ...slotProps, t, ctx, onBack: back }))), 'workbench.panel')
+      }, (slotProps) => h(PanelBoundary, null, h(Console, { ...slotProps, t, ctx, onBack: back })))), 'workbench.panel')
 
       ctx.effect(() => ctx.slots.inject('main', () => ctx.slots.register({
         name: 'main',
@@ -1298,34 +1454,21 @@ window.__ModuleLoader__.load({
         label: () => t('title'),
       }, SectionIcon)), 'workbench.section-row')
 
-      ctx.effect(() => {
-        let dispose = null
-        const sync = () => {
-          if (uiStore.expanded) {
-            if (dispose === null) {
-              dispose = ctx.slots.register({
-                name: 'sidebar.panellist',
-                id: PANEL_ID,
-                order: -29,
-                label: () => t('toolOuchn'),
-              }, ToolIcon)
-            }
-            return
-          }
-          if (dispose !== null) { dispose(); dispose = null }
-        }
-        const unsubscribe = subscribeUi(sync)
-        sync()
-        return () => {
-          unsubscribe()
-          if (dispose !== null) { dispose(); dispose = null }
-        }
-      }, 'workbench.tool-row')
+      // 工具行常驻注册：以前它依赖 uiStore.expanded，重启后如果状态没同步过来，
+      // 侧边栏就没有「国开作业」这一行，看起来像插件没加载。
+      ctx.effect(() => ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+        name: 'sidebar.panellist',
+        id: PANEL_ID,
+        order: -29,
+        label: () => t('toolOuchn'),
+      }, ToolIcon)), 'workbench.tool-row')
     }
 
     return {
       inject: ['slots', 'locale', 'layout', 'sessions', 'uiSession'],
       apply,
+      // 给离线渲染测试用：tools/render-console.mjs 直接渲染这几个纯组件。
+      __test: { Console, StatsPanel, Modal, LoginCard, taskClass },
     }
   },
 })

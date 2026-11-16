@@ -492,52 +492,61 @@ export function apply(ctx, config) {
     ctx.effect(() => ctx.tools.register(definition), `workbench.tool:${definition.name}`)
   }
 
-  const server = (() => {
+  const getServer = () => {
     try { return typeof ctx.get === 'function' ? ctx.get('webServer') : undefined } catch { return undefined }
-  })()
-  if (!server || typeof server.register !== 'function') return
+  }
 
-  const route = (routePath, resource, label) => {
-    try {
-      ctx.effect(() => server.register({ kind: 'exact', path: routePath, resource }), `workbench.route:${label}`)
-    } catch (error) {
-      try { ctx.logger?.warn?.(`workbench: ${label} route failed: ${error?.message ?? error}`) } catch { /* ignore */ }
+  /**
+   * 面板路由统一在这里注册。
+   *
+   * 关键点：DSH 重启时 webServer 可能比插件晚就绪。旧实现拿不到 server 就 `return`，
+   * 结果工具注册成功、面板路由全 404——表现就是「点插件没反应 / 必须刷新页面」。
+   */
+  function applyRoutes(server) {
+    const route = (routePath, resource, label) => {
+      try {
+        ctx.effect(() => server.register({ kind: 'exact', path: routePath, resource }), `workbench.route:${label}`)
+      } catch (error) {
+        try { ctx.logger?.warn?.(`workbench: ${label} route failed: ${error?.message ?? error}`) } catch { /* ignore */ }
+      }
     }
-  }
 
-  /** Node 风格 handler：resource 形态只吃 GET，POST 路由必须走 handler。 */
-  const rawRoute = (routePath, handler, label) => {
-    try {
-      ctx.effect(() => server.register({ kind: 'exact', path: routePath, handler }), `workbench.route:${label}`)
-    } catch (error) {
-      try { ctx.logger?.warn?.(`workbench: ${label} route failed: ${error?.message ?? error}`) } catch { /* ignore */ }
+    /** Node 风格 handler：resource 形态只吃 GET，POST 路由必须走 handler。 */
+    const rawRoute = (routePath, handler, label) => {
+      try {
+        ctx.effect(() => server.register({ kind: 'exact', path: routePath, handler }), `workbench.route:${label}`)
+      } catch (error) {
+        try { ctx.logger?.warn?.(`workbench: ${label} route failed: ${error?.message ?? error}`) } catch { /* ignore */ }
+      }
     }
-  }
 
-  const sendJson = (res, status, value) => {
-    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-    res.end(JSON.stringify(value))
-  }
+    const sendJson = (res, status, value) => {
+      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(JSON.stringify(value))
+    }
 
-  const readBody = async (req) => {
-    let raw = ''
-    try {
-      for await (const chunk of req) raw += chunk
-    } catch { /* 读失败就当空 body */ }
-    if (!raw) return {}
-    try { return JSON.parse(raw) } catch { return {} }
-  }
+    const readBody = async (req) => {
+      let raw = ''
+      try {
+        for await (const chunk of req) raw += chunk
+      } catch { /* 读失败就当空 body */ }
+      if (!raw) return {}
+      try { return JSON.parse(raw) } catch { return {} }
+    }
 
   // The panel polls this. An unchanged revision is answered with two fields so a
   // 1.5 s poll never ships the whole catalog.
-  route('/ouch/state', async (request) => {
-    const url = new URL(request.url, 'http://localhost')
-    const rev = Number(url.searchParams.get('rev') ?? '-1')
-    if (Number.isFinite(rev) && rev === service.state.rev) {
-      return json({ rev, same: true, shotRev: service.state.shotRev })
-    }
-    return json(service.snapshot())
-  }, 'state')
+    route('/ouch/state', async (request) => {
+      // 重启后第一次打开面板时还没有 tool 调用，这里补一次 hydrate，
+      // 否则面板会显示 0 门课程、0 个任务，看起来像"插件没数据"。
+      try { await service.hydrate() } catch { /* 状态文件坏了也不能挡住面板 */ }
+      const url = new URL(request.url, 'http://localhost')
+      const rev = Number(url.searchParams.get('rev') ?? '-1')
+      if (Number.isFinite(rev) && rev === service.state.rev) {
+        return json({ rev, same: true, shotRev: service.state.shotRev })
+      }
+      return json(service.snapshot())
+    }, 'state')
 
   route('/ouch/shot', async () => {
     const jpeg = service.shotJpeg()
@@ -606,6 +615,93 @@ export function apply(ctx, config) {
   }, 'client-boot')
 
   /**
+   * 面板上的「退出账号」：清 Cookie、回到登录页、清空界面数据。
+   */
+  rawRoute('/ouch/logout', async (req, res) => {
+    if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: '需要 POST' }); return }
+    try {
+      const value = await service.logout()
+      sendJson(res, 200, value)
+    } catch (error) {
+      sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
+    }
+  }, 'logout')
+
+  /**
+   * 面板上的登录表单：账号密码来自输入框，登录后自动同步一次课程与任务。
+   */
+  rawRoute('/ouch/login', async (req, res) => {
+    if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: '需要 POST' }); return }
+    const body = await readBody(req)
+    if (!String(body?.account ?? '').trim() || !String(body?.password ?? '')) {
+      sendJson(res, 400, { ok: false, error: '账号或密码为空' })
+      return
+    }
+    try {
+      const value = await service.loginWith(body.account, body.password, null)
+      sendJson(res, 200, value)
+    } catch (error) {
+      sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
+    }
+  }, 'login')
+
+  /**
+   * 一键执行控制：action = start / pause / resume / stop。
+   */
+  rawRoute('/ouch/auto', async (req, res) => {
+    if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: '需要 POST' }); return }
+    const body = await readBody(req)
+    const action = String(body?.action ?? 'start')
+    try {
+      if (action === 'pause') { sendJson(res, 200, service.pauseAuto()); return }
+      if (action === 'resume') { sendJson(res, 200, service.resumeAuto()); return }
+      if (action === 'stop') { sendJson(res, 200, await service.stopAuto()); return }
+      const value = await service.startAuto({ taskIds: body?.taskIds }, null)
+      sendJson(res, 200, value)
+    } catch (error) {
+      sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
+    }
+  }, 'auto')
+
+  /**
+   * 诊断信息：「打开日志」弹窗用它证明面板/后端到底在什么状态。
+   */
+  route('/ouch/diag', async () => {
+    let boots = []
+    try {
+      const file = path.join(service.baseDir(service.lastExec), 'client-boots.jsonl')
+      const raw = await readFile(file, 'utf8')
+      boots = raw.trim().split('\n').slice(-8).map((line) => {
+        try { return JSON.parse(line) } catch { return { raw: line.slice(0, 120) } }
+      })
+    } catch { /* 还没有报到文件 */ }
+    let stamp = null
+    try {
+      const { statSync } = await import('node:fs')
+      const info = statSync(path.join(packageDir, 'client.js'))
+      stamp = `${Math.round(info.mtimeMs)}-${info.size}`
+    } catch { /* ignore */ }
+    return json({
+      ok: true,
+      at: new Date().toISOString(),
+      clientStamp: stamp,
+      state: {
+        rev: service.state.rev,
+        status: service.state.status,
+        phase: service.state.phase,
+        shotRev: service.state.shotRev,
+        browser: service.state.browser,
+        student: service.state.student,
+        run: service.state.run,
+        current: service.state.current,
+        courses: service.state.courses.length,
+        tasks: service.state.tasks.length,
+      },
+      boots,
+    })
+  }, 'diag')
+
+  /**
    * 面板上的「同步 GitHub」：在本机把插件目录的改动 add/commit/push 到 origin。
    *
    * 可行性前提是这台机器已经配置好 git 凭据（credential helper 或 SSH key）；插件
@@ -644,6 +740,30 @@ export function apply(ctx, config) {
       sendJson(res, 500, { ok: false, error: detail.slice(0, 500) })
     }
   }, 'push')
+  }
+
+  // 立刻拿得到就立刻注册；拿不到就等 webServer 就绪（重启后它常比插件晚一步）。
+  const readyServer = getServer()
+  if (readyServer && typeof readyServer.register === 'function') {
+    applyRoutes(readyServer)
+  } else {
+    let attached = false
+    const attach = (candidate) => {
+      if (attached) return
+      const target = candidate && typeof candidate.register === 'function' ? candidate : getServer()
+      if (!target || typeof target.register !== 'function') return
+      attached = true
+      try { applyRoutes(target) } catch (error) { try { ctx.logger?.warn?.(`workbench: route attach failed: ${error?.message ?? error}`) } catch { /* ignore */ } }
+    }
+    try {
+      if (typeof ctx.inject === 'function') {
+        ctx.inject(['webServer'], (sub) => attach(sub && typeof sub.get === 'function' ? sub.get('webServer') : null))
+      }
+    } catch { /* 老版本宿主没有 ctx.inject */ }
+    const timer = setInterval(() => attach(null), 400)
+    if (timer.unref) timer.unref()
+    try { ctx.effect(() => () => clearInterval(timer), 'workbench.route-retry') } catch { /* ignore */ }
+  }
 }
 
 function json(value, status = 200) {

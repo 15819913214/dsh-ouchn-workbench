@@ -12,7 +12,7 @@ import path from 'node:path'
 import { mapOptions } from './answers.js'
 import {
   enterExam, fillExam, postForum, openForum, readCompleteness, readExam, readResult, submitExam, watchVideo,
-  inspectHomework, markCourseVideosComplete,
+  inspectHomework, markCourseVideosComplete, scrollToQuestion,
 } from './live.js'
 
 const STAGE_LABEL = { FORMATIVE: '形考', FINAL: '终考', DISCUSSION: '讨论' }
@@ -258,8 +258,22 @@ export class RealEngine {
 
     record.phase = 'filling'
     this.service.bump()
-    let filled = await fillExam(this.browser, plan)
-    let failed = (filled.report || []).filter((item) => !item.ok)
+    // 分块填写：每块 4 题，填完把页面滚到刚答的题并刷新一帧——
+    // 面板就能看到「当前科目 → 当前作业 → 当前题号」逐级往前走。
+    let failed = []
+    const CHUNK = 4
+    for (let start = 0; start < plan.length; start += CHUNK) {
+      // 面板按下「暂停」时，长任务在这里让步；继续后自动接着填。
+      while (this.service.isPaused && this.service.isPaused()) await new Promise((resolve) => setTimeout(resolve, 600))
+      const part = plan.slice(start, start + CHUNK)
+      const one = await fillExam(this.browser, part)
+      failed = failed.concat((one.report || []).filter((item) => !item.ok))
+      const last = part[part.length - 1]
+      try {
+        await scrollToQuestion(this.browser, last.seq)
+        await this.service.tickQuestion(task, last.seq, plan.length)
+      } catch { /* 热更新失败不影响作答 */ }
+    }
 
     // 平台的 Angular 组件在每次选择后会重渲染，整卷一次性填容易点到旧节点；
     // 对没填上的题逐题补填一遍再校验。

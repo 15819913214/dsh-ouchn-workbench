@@ -21,6 +21,7 @@ import { enterExam, openForum, readCompleteness, readExam } from './live.js'
 
 const MAX_TIMELINE = 140
 const MAX_TEXT = 200_000
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const STAGE_LABEL = { FORMATIVE: '形考作业', FINAL: '终考作业', DISCUSSION: '讨论题' }
 
@@ -86,6 +87,10 @@ export function emptyState() {
     real: {},
     defects: [],
     realStats: { done: 0, submitted: 0, blocked: 0, failed: 0, needsAnswers: 0, scored: 0, scoreSum: 0 },
+    // 一键执行的状态机：running/paused/total/done/current，面板据此显示 暂停/继续/停止。
+    run: { running: false, paused: false, startedAt: null, finishedAt: null, total: 0, done: 0, note: null },
+    // 逐级热更新：当前科目 → 当前作业 → 当前题号。
+    current: null,
     library: { total: 0, courses: 0, builtAt: null },
     report: null,
     startedAt: null,
@@ -140,7 +145,16 @@ export class WorkbenchService {
   }
 
   baseDir(exec) {
-    return path.join(this.workDir(exec), '.ouch')
+    const primary = path.join(this.workDir(exec), '.ouch')
+    if (exec) return primary
+    // 面板首次轮询（还没有 tool 调用）时没有 session exec：如果宿主 cwd 不是工作区，
+    // 退回到插件目录旁边的工作区 .ouch，保证重启后一打开面板就能看到上次的数据。
+    try {
+      if (existsSync(path.join(primary, 'state.json'))) return primary
+      const sibling = path.join(this.packageDir, '..', '.ouch')
+      if (existsSync(path.join(sibling, 'state.json'))) return sibling
+    } catch { /* fall through */ }
+    return primary
   }
 
   stateFile(exec) {
@@ -828,6 +842,211 @@ export class WorkbenchService {
       else if (['failed', 'error', 'submit-failed', 'fill-failed', 'verify-failed'].includes(record.phase)) stats.failed += 1
     }
     this.state.realStats = stats
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 账号：退出 / 登录
+   * ---------------------------------------------------------------- */
+
+  /**
+   * 退出当前账号：清掉浏览器 Cookie 与会话数据，回到平台登录页，并把界面数据清空。
+   *
+   * 只清本插件自己的状态，不动用户在平台上的任何记录。
+   */
+  async logout() {
+    const browser = this.browser
+    if (browser && !browser.closed) {
+      try {
+        await browser.cdp.call('Network.enable', {}, { timeoutMs: 5000 })
+        await browser.cdp.call('Network.clearBrowserCookies', {}, { timeoutMs: 5000 })
+      } catch { /* 老版本 CDP 没有 Network 域时忽略 */ }
+      try { await browser.goto('https://lms.ouchn.cn/user/courses') } catch { /* 跳转失败也继续清状态 */ }
+    }
+    // 清界面数据，但保留答案库与缺陷记录（那是本地的，不属于账号）。
+    const keep = {
+      library: this.state.library,
+      defects: this.state.defects,
+      papers: {},
+    }
+    this.state = { ...emptyState(), library: keep.library, defects: keep.defects }
+    this.state.status = 'idle'
+    this.paperCache.clear()
+    this.shot = null
+    this.state.shotRev += 1
+    this.account = ''
+    this.password = ''
+    this.bump()
+    await this.refreshShot()
+    return { ok: true, student: null }
+  }
+
+  /**
+   * 用面板上输入的账号密码登录，然后同步该学生的课程与任务。
+   *
+   * 登录态只活在这个浏览器会话里；面板刷新不会丢，DSH 重启会重新要求登录。
+   */
+  async loginWith(account, password, exec) {
+    const user = String(account ?? '').trim()
+    const pass = String(password ?? '')
+    if (!user || !pass) throw new Error('账号或密码为空')
+    this.account = user
+    this.password = pass
+    await this.hydrate(exec)
+    await this.ensureBrowser(exec)
+    this.state.phase = 'login'
+    this.bump()
+    let result
+    try {
+      result = await this.ensureLoggedIn()
+    } finally {
+      this.state.phase = null
+    }
+    this.state.student = await this.readProfile()
+    this.bump()
+    // 登录成功后顺手同步一次，面板立刻有数据。
+    const sync = await this.sync({}, exec).catch((error) => ({ ok: false, error: String(error?.message ?? error) }))
+    await this.refreshShot()
+    return {
+      ok: true,
+      student: this.state.student,
+      url: result?.url ?? this.state.browser.url,
+      courses: Array.isArray(sync?.list) ? sync.list.length : this.state.courses.length,
+      tasks: this.state.tasks.length,
+      syncError: sync?.ok === false ? sync.error : null,
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 一键执行：开始 / 暂停 / 继续 / 停止
+   * ---------------------------------------------------------------- */
+
+  /** 可自动执行的任务：排除已完成、无需做（homework/page）的任务。 */
+  autoCandidates() {
+    return this.state.tasks.filter((task) => {
+      const real = this.state.real[task.id]
+      if (real && real.phase === 'submitted') return false
+      const type = String(task.type || '')
+      if (type === 'homework' || type === 'page') return false
+      if (task.availability === 'EXPIRED' || task.availability === 'NOT_OPEN') return false
+      return true
+    })
+  }
+
+  autoState() {
+    return this.state.run ?? { running: false, paused: false, total: 0, done: 0 }
+  }
+
+  /** 一键执行是否处于「暂停」——长任务里的填题循环靠它让步。 */
+  isPaused() {
+    const run = this.state.run
+    return Boolean(run && run.running && run.paused)
+  }
+
+  /** 开始一键执行（后台跑，面板轮询状态）。 */
+  async startAuto(args = {}, exec) {
+    await this.hydrate(exec)
+    if (this.autoState().running) return { ok: true, already: true, ...this.autoState() }
+    await this.ensureBrowser(exec)
+    await this.ensureLoggedIn()
+    if (!this.state.student) this.state.student = await this.readProfile()
+    const tasks = args.taskIds?.length
+      ? this.state.tasks.filter((task) => args.taskIds.map(String).includes(String(task.id)))
+      : this.autoCandidates()
+    this.state.run = {
+      running: true,
+      paused: false,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      total: tasks.length,
+      done: 0,
+      note: `开始执行 ${tasks.length} 个任务`,
+    }
+    this.bump()
+    this.autoPromise = this.autoLoop(tasks)
+    return { ok: true, started: true, total: tasks.length }
+  }
+
+  pauseAuto() {
+    const run = this.autoState()
+    if (!run.running) return { ok: false, note: '当前没有在跑的任务' }
+    this.state.run = { ...run, paused: true, note: '已暂停' }
+    this.bump()
+    return { ok: true, paused: true }
+  }
+
+  resumeAuto() {
+    const run = this.autoState()
+    if (!run.running) return { ok: false, note: '当前没有在跑的任务' }
+    this.state.run = { ...run, paused: false, note: '继续执行' }
+    this.bump()
+    return { ok: true, paused: false }
+  }
+
+  async stopAuto() {
+    const run = this.autoState()
+    this.state.run = { ...run, running: false, paused: false, finishedAt: new Date().toISOString(), note: '已停止' }
+    this.bump()
+    return { ok: true, stopped: true }
+  }
+
+  /** 后台循环：每个任务之间检查暂停/停止，单个任务失败不中断整批。 */
+  async autoLoop(tasks) {
+    const results = []
+    try {
+      for (const task of tasks) {
+        while (this.autoState().paused && this.autoState().running) await sleep(600)
+        if (!this.autoState().running) break
+        this.state.current = {
+          taskId: task.id, course: task.courseName, title: task.title,
+          stage: task.stage, index: results.length + 1, total: tasks.length, question: null, phase: 'running',
+        }
+        this.bump()
+        let outcome
+        try {
+          outcome = await this.realEngine.runTask(task, { submit: true })
+        } catch (error) {
+          outcome = { ok: false, phase: 'error', note: String(error?.message ?? error) }
+          this.realEngine.defect(task, 'auto', outcome.note)
+        }
+        results.push({ id: task.id, phase: outcome.phase, note: outcome.note ?? null, score: outcome.score ?? null })
+        this.state.run = {
+          ...this.autoState(),
+          done: results.length,
+          total: tasks.length,
+          note: `${task.courseName} · ${task.title} → ${outcome.phase ?? 'unknown'}`,
+        }
+        this.recomputeRealStats()
+        this.bump()
+      }
+    } finally {
+      const run = this.autoState()
+      this.state.run = {
+        ...run,
+        running: false,
+        paused: false,
+        finishedAt: new Date().toISOString(),
+        note: `执行结束：完成 ${run.done}/${run.total}`,
+      }
+      this.state.current = null
+      this.bump()
+      this.autoPromise = null
+    }
+    return results
+  }
+
+  /** 逐题热更新：把当前题号写进状态并刷新一帧画面。 */
+  async tickQuestion(task, seq, total) {
+    this.state.current = {
+      ...(this.state.current ?? {}),
+      taskId: task.id,
+      course: task.courseName,
+      title: task.title,
+      question: seq,
+      questionTotal: total,
+      phase: 'answering',
+    }
+    this.bump(false)
+    await this.refreshShot()
   }
 
   async library(args, exec) {
