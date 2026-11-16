@@ -146,13 +146,17 @@ export class WorkbenchService {
 
   baseDir(exec) {
     const primary = path.join(this.workDir(exec), '.ouch')
-    if (exec) return primary
     // 面板首次轮询（还没有 tool 调用）时没有 session exec：如果宿主 cwd 不是工作区，
     // 退回到插件目录旁边的工作区 .ouch，保证重启后一打开面板就能看到上次的数据。
+    // 老版本会把状态写到宿主进程目录（cwd）下：只有当工作区还没有状态文件时才沿用
+    // 那份旧数据，一旦工作区有了自己的状态就固定在工作区，避免两个文件互相覆盖。
     try {
       if (existsSync(path.join(primary, 'state.json'))) return primary
       const sibling = path.join(this.packageDir, '..', '.ouch')
-      if (existsSync(path.join(sibling, 'state.json'))) return sibling
+      if (sibling !== primary && existsSync(path.join(sibling, 'state.json'))) return sibling
+      if (!exec) return primary
+      const legacy = path.join(this.fallbackWorkDir, '.ouch')
+      if (legacy !== primary && existsSync(path.join(legacy, 'state.json'))) return legacy
     } catch { /* fall through */ }
     return primary
   }

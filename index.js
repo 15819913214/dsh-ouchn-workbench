@@ -478,7 +478,10 @@ function createTools(getService) {
 export function apply(ctx, config) {
   const service = new WorkbenchService(ctx, {
     packageDir,
-    workDir: readConfig(config, 'workDir', '') || undefined,
+    // 状态、截图、papers 落在插件目录的上一级（即仓库工作区）。
+    // 之前没传 workDir 时会退回 process.cwd()（宿主进程目录），状态文件被写到
+    // `%USERPROFILE%\.dsh\profiles\desktop\.ouch`，换台机器/换 cwd 就读不到上次进度。
+    workDir: readConfig(config, 'workDir', '') || path.join(packageDir, '..'),
     // Optional: an answer bank kept outside the plugin package.
     dataDir: readConfig(config, 'dataDir', '') || undefined,
     // Credentials come from the plugin config or, failing that, the environment,
