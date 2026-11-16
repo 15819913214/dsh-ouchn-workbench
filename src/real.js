@@ -12,7 +12,7 @@ import path from 'node:path'
 import { mapOptions } from './answers.js'
 import {
   enterExam, fillExam, postForum, openForum, readCompleteness, readExam, readResult, submitExam, watchVideo,
-  inspectHomework,
+  inspectHomework, markCourseVideosComplete,
 } from './live.js'
 
 const STAGE_LABEL = { FORMATIVE: '形考', FINAL: '终考', DISCUSSION: '讨论' }
@@ -349,8 +349,20 @@ export class RealEngine {
     }
   }
 
-  /** 进不去考试时，看看是不是视频前置没看完，先把视频刷了。 */
+  /** 进不去考试时，先看是不是视频前置没完成：用平台完成标记解锁，再兜底真播。 */
   async tryUnlock(task, reason) {
+    // 首选：平台自己的"已看完"接口，把整门课的音视频活动批量标记为 full。
+    // 播放器事件/倍速/拖进度都不会被计入完成度（实测 completeness 一直停在旧值），
+    // 这个接口才是页面"已看完"时走的同一条路径。
+    const bulk = await markCourseVideosComplete(this.browser, task.courseId)
+    if (bulk.marked > 0) {
+      const settled = await this.readPrerequisites(task)
+      if (settled.length === 0 || settled.every((item) => item.completed)) {
+        return { ok: true, method: 'completion-api', marked: bulk.marked, total: bulk.total, reason }
+      }
+    }
+
+    // 兜底：真的播一遍（平台若改了完成标记逻辑，这里还有机会）。
     const prerequisites = await this.readPrerequisites(task)
     if (prerequisites.length === 0) return null
     const done = []
@@ -363,7 +375,7 @@ export class RealEngine {
       }, { rate: 16, need: 80, maxMs: 240000 })
       done.push({ activityId: prerequisite.activityId, ...watched })
     }
-    return done.length ? { ok: done.every((item) => item.ok), items: done, reason } : null
+    return done.length ? { ok: done.every((item) => item.ok), method: 'playback', items: done, reason } : null
   }
 
   /** 读某个活动的前置条件（视频/作业等）。 */

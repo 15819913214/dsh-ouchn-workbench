@@ -20,6 +20,20 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'workbench'
     const TOGGLE_PANEL_ID = 'workbench-toggle'
 
+    /**
+     * 前端构建戳。每次改客户端代码就把它改掉：`dsh-client-hmr` 轮询到 client.js
+     * 的 mtime/size 变化后会把整个模块重新执行一遍，页面不用刷新就能拿到新 UI，
+     * 这里顺便向 Host 报到一次，方便用 `.ouch/client-boots.jsonl` 验证热更新真的发生了。
+     */
+    const CLIENT_BUILD = '2026-11-17T00:20+08:00'
+    try {
+      fetch('/ouch/client-boot', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ build: CLIENT_BUILD, at: Date.now(), href: String(location.href) }),
+      }).catch(() => {})
+    } catch { /* 报到只是诊断，失败不影响面板 */ }
+
     const LOGIN_URL = 'https://iam.pt.ouchn.cn/am/oauth2/authorize?service=initService&response_type=code'
       + '&client_id=345fcbaf076a4f8a&scope=all'
       + '&redirect_uri=https%3A%2F%2Fmenhu.pt.ouchn.cn%2Fouchnapp%2Fwap%2Flogin%2Findex&decision=Allow'
@@ -703,8 +717,32 @@ window.__ModuleLoader__.load({
       const [stage, setStage] = useState('ALL')
       const [taskId, setTaskId] = useState(null)
       const [layout, setLayout] = useState(loadLayout)
+      // 「同步到 GitHub」按钮的状态：idle / running / done / error
+      const [pushState, setPushState] = useState('idle')
+      const [pushNote, setPushNote] = useState('')
 
       useEffect(() => { saveLayout(layout) }, [layout])
+
+      // 兜底热更新：Host 回报的 client.js 构建戳一变就自动重载页面。
+      // 页面初次加载只记基线，不会自己触发重载；dsh-client-hmr 送到热替换时
+      // 模块重新执行、基线也重置，两条路径互不打扰。
+      useEffect(() => {
+        let baseline = null
+        let stopped = false
+        const timer = setInterval(async () => {
+          if (stopped) return
+          try {
+            const response = await fetch('/ouch/ui-stamp', { cache: 'no-store' })
+            if (!response.ok) return
+            const data = await response.json()
+            const stamp = String(data?.stamp ?? '')
+            if (!stamp) return
+            if (baseline === null) { baseline = stamp; return }
+            if (stamp !== baseline) { stopped = true; location.reload() }
+          } catch { /* 网络抖动忽略 */ }
+        }, 4000)
+        return () => { stopped = true; clearInterval(timer) }
+      }, [])
 
       const courses = snapshot?.courses ?? []
       const tasks = snapshot?.tasks ?? []
@@ -805,6 +843,27 @@ window.__ModuleLoader__.load({
         if (node) node.scrollTop = node.scrollHeight
       }, [timeline.length])
 
+      /** 把当前工作区提交并推送到 GitHub（Host 侧执行 git，前端只发起与显示结果）。 */
+      const pushToGithub = useCallback(async () => {
+        if (pushState === 'running') return
+        setPushState('running')
+        setPushNote('正在提交并推送…')
+        try {
+          const response = await fetch('/ouch/push', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ message: `chore: 执行台面板同步 ${new Date().toLocaleString('zh-CN')}` }),
+          })
+          const data = await response.json().catch(() => ({}))
+          if (!response.ok || data.ok !== true) throw new Error(data.error || data.note || `HTTP ${response.status}`)
+          setPushState('done')
+          setPushNote(data.note || `已推送 ${data.commit ?? ''}`.trim())
+        } catch (failure) {
+          setPushState('error')
+          setPushNote(String(failure?.message ?? failure))
+        }
+      }, [pushState])
+
       return h('div', { style: S.page, 'data-workbench-root': '' },
         h('style', null, KEYFRAMES),
         // ---------------------------------------------------------------- header
@@ -842,6 +901,16 @@ window.__ModuleLoader__.load({
               }, t('openReport'))
               : null,
             h('button', { type: 'button', style: S.btn, onClick: () => { reload() } }, t('refresh')),
+            h('button', {
+              type: 'button',
+              style: {
+                ...S.btn,
+                borderColor: pushState === 'error' ? 'rgba(239,122,122,.5)' : pushState === 'done' ? 'rgba(74,222,128,.45)' : S.btn.borderColor,
+                color: pushState === 'error' ? '#f0a0a0' : pushState === 'done' ? '#7ee2a8' : S.btn.color,
+              },
+              onClick: pushToGithub,
+              title: pushNote || 'git add / commit / push 到 GitHub 仓库',
+            }, pushState === 'running' ? '同步中…' : pushState === 'done' ? '已同步' : pushState === 'error' ? '同步失败' : '同步 GitHub'),
             h('button', { type: 'button', style: S.btn, onClick: () => props.onBack() }, t('back')),
           ),
         ),

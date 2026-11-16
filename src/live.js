@@ -646,6 +646,63 @@ export async function readCompleteness(session, courseId, activityId) {
 }
 
 /**
+ * 用平台自己的"已看完"完成标记把一条音视频活动记为完成。
+ *
+ * 这是参考实现（HomeworkCopilot `app/core/automation/video.py`）披露的关键点：
+ * 视频完成度并不来自 `<video>` 的播放事件，而是页面在"已看完"时调用
+ * `POST /api/course/activities-read/{id}`，请求体是
+ * `{activity_id, activity_type:"learning_activity", completeness:"full"}`。
+ * 实测把 `completeness` 换成数字百分比或 "done" 都不被接受；`"full"` 才会把
+ * 记录的 `completeness` 从 `part` 翻成 `full`，前置条件随即解除。
+ */
+export async function markActivityComplete(session, activityId) {
+  const id = Number(activityId)
+  if (!Number.isFinite(id)) return { ok: false, note: '活动 id 不合法' }
+  const value = await session.evaluate(`fetch(${JSON.stringify(`/api/course/activities-read/${id}`)}, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ activity_id: ${id}, activity_type: 'learning_activity', completeness: 'full' }),
+  })
+    .then(async (response) => ({ status: response.status, body: (await response.text()).slice(0, 220) }))
+    .catch((error) => ({ status: 0, body: String(error && error.message || error) }))`)
+  const done = value && Number(value.status) >= 200 && Number(value.status) < 300
+  return { ok: Boolean(done), status: value?.status ?? 0, body: value?.body ?? '' }
+}
+
+/**
+ * 把一门课里所有音视频活动批量标记完成，返回标记结果。
+ *
+ * 形势与政策的专题测验被"音视频教材 1-4 累计观看 80%"锁着，逐条真的播放既慢又
+ * 不被平台计入（实测倍速/拖进度都不算），所以走平台自己的完成标记接口。
+ */
+export async function markCourseVideosComplete(session, courseId) {
+  const videos = await session.evaluate(`fetch(${JSON.stringify(`/api/courses/${courseId}/activities?fields=id,title,type`)}, { credentials: 'include' })
+    .then((response) => response.json())
+    .then((json) => {
+      const list = Array.isArray(json) ? json : (json && (json.activities || json.list)) || []
+      return list
+        .filter((item) => String(item.type || '').indexOf('video') >= 0)
+        .map((item) => ({ id: item.id, title: item.title, type: item.type }))
+    })
+    .catch(() => [])`)
+  if (!Array.isArray(videos) || videos.length === 0) {
+    return { total: 0, marked: 0, failed: 0, items: [] }
+  }
+  const items = []
+  for (const video of videos) {
+    const result = await markActivityComplete(session, video.id)
+    items.push({ id: video.id, title: video.title, ok: result.ok, status: result.status })
+  }
+  return {
+    total: videos.length,
+    marked: items.filter((item) => item.ok).length,
+    failed: items.filter((item) => !item.ok).length,
+    items,
+  }
+}
+
+/**
  * 播放视频直到完成度达标。
  *
  * 平台按播放器上报的观看向量算完成度，所以不能只改 currentTime，必须真的播：

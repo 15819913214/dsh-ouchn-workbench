@@ -12,7 +12,9 @@
  * parameters, output, execute }`.
  */
 import path from 'node:path'
-import { readFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { appendFile, mkdir, readFile } from 'node:fs/promises'
+import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { WorkbenchService } from './src/service.js'
 import { renderPaper } from './src/mock.js'
@@ -503,6 +505,29 @@ export function apply(ctx, config) {
     }
   }
 
+  /** Node 风格 handler：resource 形态只吃 GET，POST 路由必须走 handler。 */
+  const rawRoute = (routePath, handler, label) => {
+    try {
+      ctx.effect(() => server.register({ kind: 'exact', path: routePath, handler }), `workbench.route:${label}`)
+    } catch (error) {
+      try { ctx.logger?.warn?.(`workbench: ${label} route failed: ${error?.message ?? error}`) } catch { /* ignore */ }
+    }
+  }
+
+  const sendJson = (res, status, value) => {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(value))
+  }
+
+  const readBody = async (req) => {
+    let raw = ''
+    try {
+      for await (const chunk of req) raw += chunk
+    } catch { /* 读失败就当空 body */ }
+    if (!raw) return {}
+    try { return JSON.parse(raw) } catch { return {} }
+  }
+
   // The panel polls this. An unchanged revision is answered with two fields so a
   // 1.5 s poll never ships the whole catalog.
   route('/ouch/state', async (request) => {
@@ -542,10 +567,88 @@ export function apply(ctx, config) {
       return new Response('no report', { status: 404 })
     }
   }, 'report')
+
+  /**
+   * 前端构建戳：面板每几秒比一次，发现 `client.js` 被改过就自动重载页面。
+   * 这是 `dsh-client-hmr` 之外的兜底——HMR 在页面已连接时能把模块热替换掉，
+   * 这条轮询保证即使 HMR 没送到（例如面板还没打开过），也不会停留在旧 UI。
+   */
+  route('/ouch/ui-stamp', async () => {
+    try {
+      const { statSync } = await import('node:fs')
+      const info = statSync(path.join(packageDir, 'client.js'))
+      return json({ ok: true, stamp: `${Math.round(info.mtimeMs)}-${info.size}` })
+    } catch (error) {
+      return json({ ok: false, error: String(error?.message ?? error) }, 500)
+    }
+  }, 'ui-stamp')
+
+  /**
+   * 前端构建报到：客户端模块每被浏览器执行一次（含 dsh-client-hmr 的热替换）就
+   * POST 一次。用 `.ouch/client-boots.jsonl` 的时间线就能证明「改代码后不需要刷新
+   * 页面」——新 build 戳出现即说明热更新生效。
+   */
+  rawRoute('/ouch/client-boot', async (req, res) => {
+    if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: '需要 POST' }); return }
+    const body = await readBody(req)
+    const stamp = {
+      at: new Date().toISOString(),
+      build: String(body?.build ?? '').slice(0, 64),
+      href: String(body?.href ?? '').slice(0, 200),
+      clientAt: Number(body?.at ?? 0),
+    }
+    try {
+      const dir = service.baseDir(service.lastExec)
+      await mkdir(dir, { recursive: true })
+      await appendFile(path.join(dir, 'client-boots.jsonl'), `${JSON.stringify(stamp)}\n`, 'utf8')
+    } catch { /* 只是诊断日志 */ }
+    sendJson(res, 200, { ok: true, build: stamp.build })
+  }, 'client-boot')
+
+  /**
+   * 面板上的「同步 GitHub」：在本机把插件目录的改动 add/commit/push 到 origin。
+   *
+   * 可行性前提是这台机器已经配置好 git 凭据（credential helper 或 SSH key）；插件
+   * 不保存任何 token。只允许本机回环地址调用，避免被局域网页面当作推送代理。
+   */
+  rawRoute('/ouch/push', async (req, res) => {
+    if (req.method !== 'POST') { sendJson(res, 405, { ok: false, error: '需要 POST' }); return }
+    const remote = String(req.socket?.remoteAddress ?? '')
+    if (!/^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/.test(remote)) {
+      sendJson(res, 403, { ok: false, error: '只允许本机调用' })
+      return
+    }
+    const body = await readBody(req)
+    const message = String(body?.message ?? '').trim().slice(0, 180) || 'chore: 执行台面板同步'
+    const run = promisify(execFile)
+    const options = { cwd: packageDir, timeout: 90000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }
+    try {
+      const status = await run('git', ['status', '--porcelain'], options)
+      const dirty = String(status.stdout ?? '').trim().length > 0
+      if (dirty) {
+        await run('git', ['add', '-A'], options)
+        await run('git', ['-c', 'user.name=dsh-workbench', '-c', 'user.email=workbench@local', 'commit', '-m', message], options)
+      }
+      const push = await run('git', ['push', 'origin', 'HEAD'], options)
+      const head = await run('git', ['rev-parse', '--short', 'HEAD'], options)
+      const branch = await run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], options)
+      sendJson(res, 200, {
+        ok: true,
+        commit: String(head.stdout ?? '').trim(),
+        branch: String(branch.stdout ?? '').trim(),
+        note: dirty ? '已提交并推送' : '没有新改动，已确认与远端同步',
+        output: String(push.stderr || push.stdout || '').trim().slice(-300),
+      })
+    } catch (error) {
+      const detail = String(error?.stderr || error?.stdout || error?.message || error).trim()
+      sendJson(res, 500, { ok: false, error: detail.slice(0, 500) })
+    }
+  }, 'push')
 }
 
-function json(value) {
+function json(value, status = 200) {
   return new Response(JSON.stringify(value), {
+    status,
     headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
   })
 }

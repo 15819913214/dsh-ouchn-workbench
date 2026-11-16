@@ -121,10 +121,20 @@ python tools/build-answers.py --db "C:\...\HomeworkCopilot\data\homework.db" --o
 
 - 真实模式会创建答题记录、交卷、发帖——这是它的功能，不是副作用；跑之前确认账号和课程范围；
 - **不漏题**：只要有一道题没有答案就不交卷，返回 `needs-answers` 让 agent 补；
-- 视频前置：`tryUnlock` 读 `/api/activities/{id}` 的 prerequisites，对 `online_video` 用倍速播放直到完成度达标；
+- 视频前置：`tryUnlock` 先走平台自己的「已看完」完成标记——对每门课的音视频活动 `POST /api/course/activities-read/{id}`，请求体
+  `{"activity_id": id, "activity_type": "learning_activity", "completeness": "full"}`，
+  平台会把记录的 `completeness` 从 `part` 翻成 `full`，前置条件随即解除；倍速/拖进度不会被计入完成度，只在接口失败时兜底真播；
 - 平台限制类情况（未分配、已截止、需教师批改、需手机端口语）只记录原因，不强行提交；
 - 题目来自本地答案库 + 人工/AI 答案，不是实时题库；覆盖不到的题会列出来；
 - 登录遇到验证码/滑块会明确报错，不尝试绕过。
+
+## 面板与开发
+
+- **热更新**：`client.js` 的 mtime/size 变化会被 `@deepseek-ai/dsh-client-hmr` 轮询到，已打开的页面会直接热替换模块，不必手动刷新；
+  面板另外每 4 秒比一次 `/ouch/ui-stamp`，作为 HMR 未送达时的兜底自动重载。
+  想看热更新到底有没有发生，看 `.ouch/client-boots.jsonl`：模块每被浏览器执行一次就落一行 `build` 戳。
+- **同步 GitHub**：面板右上角「同步 GitHub」按钮 → `POST /ouch/push`，Host 在本机执行 `git add -A / commit / push origin HEAD`；
+  只接受 `127.0.0.1`/`::1` 调用，插件不保存任何 token，用的是这台机器已配置好的 git 凭据。没有改动时只做 `git push` 确认同步。
 
 ## 开发
 
